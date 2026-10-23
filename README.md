@@ -6,6 +6,61 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # GSConnect
 
+> [!NOTE]
+> This is a fork of [GSConnect][upstream] that adds sharing of **images and
+> files through the clipboard**, as supported by KDE Connect. The changes are
+> proposed upstream in [GSConnect#2208][upstream-pr]. Everything below this note
+> is the upstream README, and the links in it point to the upstream project.
+
+## About This Fork
+
+The `hidoba` branch is upstream GSConnect plus:
+
+* **Clipboard images and files**: copying a file or an image shares it with
+  connected devices, using KDE Connect's `kdeconnect.clipboard.file` packet.
+  * Copied images are sent as PNG, and copied files as-is, up to 50 MiB.
+  * Received images are placed in the clipboard as images, ready to paste into
+    applications. Other received files can be pasted as files, for example in
+    Files (Nautilus).
+  * Received files are kept in `~/.cache/gsconnect/<device-id>/clipboard/`
+    until the next one replaces them.
+  * The existing clipboard settings, "send" and "receive content", apply to
+    files and images too.
+* **Fewer clipboard transfers** ([#2122][issue-2122]): text is only requested
+  when the clipboard offers it, and image data is only read when it is sent to a
+  device.
+* **Clipboard fixes**: the GNOME Shell portal's `GetValue` method works again,
+  and text sync works again on other Wayland desktops (via `wl-clipboard`).
+* **Version 1000**, so that extensions.gnome.org never replaces the fork with
+  an upstream release.
+
+Images and files are only exchanged with devices that support them. Currently
+that means the desktop KDE Connect apps (Linux, Windows and macOS) and
+GSConnect with these changes. KDE Connect for Android doesn't support them yet,
+so it only syncs text. On X11, a received file that isn't an image is pasted as
+its path, because GTK 3 can't offer a file list.
+
+### Installing
+
+Building requires `meson`, `ninja` and `gettext`:
+
+```sh
+git clone https://github.com/hidoba/gnome-shell-extension-gsconnect.git
+cd gnome-shell-extension-gsconnect
+meson setup _build
+ninja -C _build make-zip
+gnome-extensions install --force _build/gsconnect@andyholmes.github.io.zip
+```
+
+This replaces an installed GSConnect, and existing pairings and settings are
+kept. On Wayland, log out and back in to load the new version.
+
+[upstream]: https://github.com/GSConnect/gnome-shell-extension-gsconnect
+[upstream-pr]: https://github.com/GSConnect/gnome-shell-extension-gsconnect/pull/2208
+[issue-2122]: https://github.com/GSConnect/gnome-shell-extension-gsconnect/issues/2122
+
+---
+
 [<img src="https://raw.githubusercontent.com/andyholmes/gnome-shell-extensions-badge/master/get-it-on-ego.svg?sanitize=true" alt="Get it on GNOME Extensions" height="100" align="middle">][ego] [<img alt="Available in the Chrome Web Store" src="https://raw.githubusercontent.com/GSConnect/gnome-shell-extension-gsconnect/main/data/images/chrome-badge.png" align="middle" hspace="12"/>][chrome] [<img src="https://raw.githubusercontent.com/GSConnect/gnome-shell-extension-gsconnect/main/data/images/firefox-badge.png" alt="Get the Add-On" align="middle">][firefox]
 
 ## Overview
