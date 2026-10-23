@@ -288,6 +288,37 @@ describe('The clipboard plugin', function () {
         expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
     });
 
+    it('cancels receiving a file superseded by text', async function () {
+        const transfer = {
+            addFile() {},
+            start() {
+                return new Promise((resolve, reject) => {
+                    this.cancel = jasmine.createSpy('cancel').and.callFake(() => {
+                        reject(new Gio.IOErrorEnum({
+                            code: Gio.IOErrorEnum.CANCELLED,
+                            message: 'Cancelled',
+                        }));
+                    });
+                });
+            },
+        };
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin._clipboard, 'setFile');
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'newer'},
+        }));
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.text).toBe('newer');
+    });
+
     it('rejects files that are too large', async function () {
         spyOn(remotePlugin.device, 'createTransfer');
         spyOn(remotePlugin.device, 'rejectTransfer');

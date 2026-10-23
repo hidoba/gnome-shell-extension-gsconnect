@@ -9,13 +9,13 @@ import GObject from 'gi://GObject';
 
 import Config from '../../config.js';
 import * as Components from '../components/index.js';
+import Plugin from '../plugin.js';
 import {
     MAX_IMAGE_PIXELS,
     decodeImage,
     encodePng,
     getImageChecksum
-} from '../components/clipboard.js';
-import Plugin from '../plugin.js';
+} from '../utils/image.js';
 
 
 export const Metadata = {
@@ -116,8 +116,9 @@ const ClipboardPlugin = GObject.registerClass({
         // The last content applied to the local clipboard from the device
         this._pulledContent = null;
 
-        // The pending transfer of a file or image to the device
+        // The pending transfers of a file or image to and from the device
         this._outgoingTransfer = null;
+        this._incomingTransfer = null;
 
         // Serials, to ignore operations superseded by a clipboard change
         this._localSerial = 0;
@@ -126,6 +127,9 @@ const ClipboardPlugin = GObject.registerClass({
 
     connected() {
         super.connected();
+
+        // The remote clipboard may have changed while disconnected
+        this._remoteContent = null;
 
         // TODO: if we're not auto-syncing local->remote, but we are doing the
         //       reverse, it's possible older remote content will end up
@@ -197,8 +201,9 @@ const ClipboardPlugin = GObject.registerClass({
      * Recursively delete the contents of a directory.
      *
      * @param {Gio.File} dir - A directory
+     * @param {Gio.File} [keep] - A child to keep
      */
-    async _deleteChildren(dir) {
+    async _deleteChildren(dir, keep = null) {
         const iter = await dir.enumerate_children_async(
             [
                 Gio.FILE_ATTRIBUTE_STANDARD_NAME,
@@ -214,6 +219,9 @@ const ClipboardPlugin = GObject.registerClass({
                 GLib.PRIORITY_DEFAULT, this.cancellable)).length > 0) {
                 for (const info of infos) {
                     const child = iter.get_child(info);
+
+                    if (keep !== null && child.equal(keep))
+                        continue;
 
                     try {
                         if (info.get_file_type() === Gio.FileType.DIRECTORY)
@@ -236,10 +244,11 @@ const ClipboardPlugin = GObject.registerClass({
      * Remove previously received files, which are no longer in the clipboard.
      *
      * @param {Gio.File} dir - The receive directory
+     * @param {Gio.File} keep - The directory of the current file
      */
-    async _cleanReceiveDirectory(dir) {
+    async _cleanReceiveDirectory(dir, keep) {
         try {
-            await this._deleteChildren(dir);
+            await this._deleteChildren(dir, keep);
         } catch (e) {
             if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
@@ -269,6 +278,7 @@ const ClipboardPlugin = GObject.registerClass({
         }
 
         // The remote clipboard changed, regardless of the file being accepted
+        this._cancelIncomingTransfer();
         const serial = ++this._remoteSerial;
         this._remoteContent = null;
         this._remoteBuffer = null;
@@ -290,24 +300,24 @@ const ClipboardPlugin = GObject.registerClass({
                 basename.includes('/'))
                 basename = 'unnamed-file';
 
-            const receiveDir = this._getReceiveDirectory();
-            await this._cleanReceiveDirectory(receiveDir);
-
-            // Ignore files superseded while cleaning up
-            if (serial !== this._remoteSerial) {
-                this.device.rejectTransfer(packet);
-                return;
-            }
-
             // Each file gets its own directory, so a superseded transfer can
             // be removed without affecting a newer file of the same name
+            const receiveDir = this._getReceiveDirectory();
             dir = receiveDir.get_child(`${Date.now()}-${serial}`);
             dir.make_directory(null);
 
             const file = dir.get_child(basename);
             const transfer = this.device.createTransfer();
             transfer.addFile(packet, file);
-            await transfer.start(this.cancellable);
+
+            this._incomingTransfer = transfer;
+
+            try {
+                await transfer.start(this.cancellable);
+            } finally {
+                if (this._incomingTransfer === transfer)
+                    this._incomingTransfer = null;
+            }
 
             const content = await this._loadFile(file);
 
@@ -317,6 +327,9 @@ const ClipboardPlugin = GObject.registerClass({
                 return;
             }
 
+            // Remove previously received files, now that this one replaces
+            // them in the clipboard
+            await this._cleanReceiveDirectory(receiveDir, dir);
             this._onRemoteClipboardChanged(content);
         } catch (e) {
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
@@ -404,8 +417,10 @@ const ClipboardPlugin = GObject.registerClass({
         }
 
         // Supersede any file still being received
-        if (content.type === 'text')
+        if (content.type === 'text') {
+            this._cancelIncomingTransfer();
             this._remoteSerial++;
+        }
 
         this._remoteContent = content;
 
@@ -443,6 +458,17 @@ const ClipboardPlugin = GObject.registerClass({
 
         const incoming = this.device.settings.get_strv('incoming-capabilities');
         return incoming.includes('kdeconnect.clipboard.file');
+    }
+
+    /**
+     * Cancel the pending transfer of a file or image from the device, which
+     * has been superseded by newer clipboard content.
+     */
+    _cancelIncomingTransfer() {
+        if (this._incomingTransfer !== null) {
+            this._incomingTransfer.cancel();
+            this._incomingTransfer = null;
+        }
     }
 
     /**
@@ -631,6 +657,7 @@ const ClipboardPlugin = GObject.registerClass({
     }
 
     destroy() {
+        this._cancelIncomingTransfer();
         this._cancelOutgoingTransfer();
 
         if (this._clipboard && this._contentChangedId) {

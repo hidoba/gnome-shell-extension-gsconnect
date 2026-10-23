@@ -8,11 +8,6 @@ import GObject from 'gi://GObject';
 
 import * as DBus from './service/utils/dbus.js';
 
-// laucher for wl-clipboard
-const launcher = new Gio.SubprocessLauncher({
-    flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
-});
-
 /*
  * DBus Interface Info
  */
@@ -203,7 +198,36 @@ export const Clipboard = GObject.registerClass(
                 });
             }
 
-            launcher.spawnv(['wl-copy', '--', text]);
+            this._wlCopy(new TextEncoder().encode(text));
+        }
+
+        /**
+         * Run wl-copy with {@link value} as input.
+         *
+         * @param {Uint8Array} value - The value to copy
+         * @param {string} [mimetype] - The mimetype of the value, inferred by
+         *   wl-copy if not given
+         */
+        _wlCopy(value, mimetype = null) {
+            const argv = ['wl-copy'];
+
+            if (mimetype !== null)
+                argv.push('--type', mimetype);
+
+            // wl-copy forks to serve the clipboard, so its output is
+            // silenced to avoid waiting for the fork to exit
+            const proc = Gio.Subprocess.new(argv,
+                Gio.SubprocessFlags.STDIN_PIPE |
+                Gio.SubprocessFlags.STDOUT_SILENCE |
+                Gio.SubprocessFlags.STDERR_SILENCE);
+
+            proc.communicate_async(new GLib.Bytes(value), null, (proc, res) => {
+                try {
+                    proc.communicate_finish(res);
+                } catch (e) {
+                    logError(e);
+                }
+            });
         }
 
         /**
@@ -232,20 +256,7 @@ export const Clipboard = GObject.registerClass(
          * @returns {void}
          */
         SetValue(value, mimetype) {
-            // wl-copy forks to serve the clipboard, so its output is
-            // silenced to avoid waiting for the fork to exit
-            const proc = Gio.Subprocess.new(['wl-copy', '--type', mimetype],
-                Gio.SubprocessFlags.STDIN_PIPE |
-                Gio.SubprocessFlags.STDOUT_SILENCE |
-                Gio.SubprocessFlags.STDERR_SILENCE);
-
-            proc.communicate_async(new GLib.Bytes(value), null, (proc, res) => {
-                try {
-                    proc.communicate_finish(res);
-                } catch (e) {
-                    logError(e);
-                }
-            });
+            this._wlCopy(value, mimetype);
         }
 
         destroy() {

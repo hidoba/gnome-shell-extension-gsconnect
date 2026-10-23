@@ -9,7 +9,7 @@ const {
     decodeImage,
     encodePng,
     getImageChecksum,
-} = await import(`file://${Config.PACKAGE_DATADIR}/service/components/clipboard.js`);
+} = await import(`file://${Config.PACKAGE_DATADIR}/service/utils/image.js`);
 
 
 const Component = GObject.registerClass({
