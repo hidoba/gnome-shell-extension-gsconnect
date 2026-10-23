@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import Gdk from 'gi://Gdk';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import Gio from 'gi://Gio';
@@ -11,6 +12,115 @@ import GObject from 'gi://GObject';
 
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const DBUS_PATH = '/org/gnome/Shell/Extensions/GSConnect/Clipboard';
+
+
+/*
+ * Mimetypes the clipboard portals are able to return as text
+ */
+const TEXT_MIMETYPES = [
+    'text/plain;charset=utf-8',
+    'UTF8_STRING',
+    'text/plain',
+    'STRING',
+];
+
+/*
+ * Image mimetypes in order of preference; any other `image/*` type is tried
+ * after these.
+ */
+const IMAGE_MIMETYPES = [
+    'image/png',
+    'image/jpeg',
+    'image/bmp',
+    'image/gif',
+    'image/tiff',
+    'image/webp',
+];
+
+
+/**
+ * Get the local file URIs from a `text/uri-list` (RFC 2483).
+ *
+ * @param {string} uriList - The contents of a `text/uri-list`
+ * @returns {string[]} A list of `file://` URIs
+ */
+export function parseUriList(uriList) {
+    return uriList.split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && !line.startsWith('#'))
+        .filter(uri => GLib.uri_parse_scheme(uri) === 'file');
+}
+
+
+/**
+ * Get the preferred image mimetype from a list of mimetypes.
+ *
+ * @param {string[]} mimetypes - A list of mimetypes
+ * @returns {string|undefined} An image mimetype, or %undefined if none
+ */
+function getImageMimetype(mimetypes) {
+    return IMAGE_MIMETYPES.find(type => mimetypes.includes(type)) ??
+        mimetypes.find(type => type.startsWith('image/') &&
+            type !== 'image/svg+xml');
+}
+
+
+/**
+ * Decode image data into a pixbuf.
+ *
+ * @param {GLib.Bytes} bytes - Encoded image data
+ * @returns {GdkPixbuf.Pixbuf} A pixbuf
+ */
+export function decodeImage(bytes) {
+    const loader = new GdkPixbuf.PixbufLoader();
+
+    try {
+        loader.write_bytes(bytes);
+    } finally {
+        loader.close();
+    }
+
+    const pixbuf = loader.get_pixbuf();
+
+    if (pixbuf === null)
+        throw new Error('Failed to decode image');
+
+    return pixbuf.apply_embedded_orientation() ?? pixbuf;
+}
+
+
+/**
+ * Encode a pixbuf as PNG data.
+ *
+ * @param {GdkPixbuf.Pixbuf} pixbuf - A pixbuf
+ * @returns {GLib.Bytes} PNG data
+ */
+export function encodePng(pixbuf) {
+    const [, buffer] = pixbuf.save_to_bufferv('png', [], []);
+
+    return new GLib.Bytes(buffer);
+}
+
+
+/**
+ * Get a checksum for the pixel data of a pixbuf.
+ *
+ * This is used to recognize an image regardless of how it was encoded.
+ *
+ * @param {GdkPixbuf.Pixbuf} pixbuf - A pixbuf
+ * @returns {string} A checksum
+ */
+export function getImageChecksum(pixbuf) {
+    // Normalize to 8-bit RGBA, which has no padding between rows
+    if (!pixbuf.has_alpha)
+        pixbuf = pixbuf.add_alpha(false, 0, 0, 0);
+
+    const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
+    checksum.update(new TextEncoder().encode(`${pixbuf.width}x${pixbuf.height}:`));
+    checksum.update(pixbuf.read_pixel_bytes().toArray());
+
+    return checksum.get_string();
+}
 
 
 /**
@@ -27,6 +137,11 @@ const Clipboard = GObject.registerClass({
             ''
         ),
     },
+    Signals: {
+        'content-changed': {
+            flags: GObject.SignalFlags.RUN_FIRST,
+        },
+    },
 }, class Clipboard extends GObject.Object {
 
     _init() {
@@ -34,6 +149,9 @@ const Clipboard = GObject.registerClass({
 
         this._cancellable = new Gio.Cancellable();
         this._clipboard = null;
+        this._content = null;
+        this._image = null;
+        this._serial = 0;
 
         this._ownerChangeId = 0;
         this._nameWatcherId = Gio.bus_watch_name(
@@ -43,6 +161,20 @@ const Clipboard = GObject.registerClass({
             this._onNameAppeared.bind(this),
             this._onNameVanished.bind(this)
         );
+    }
+
+    /**
+     * A description of the current clipboard content, or %null if unknown.
+     *
+     * One of:
+     * - `{type: 'text', text: string}`
+     * - `{type: 'file', uri: string}`
+     * - `{type: 'image', mimetype: string}`
+     *
+     * @type {object|null}
+     */
+    get content() {
+        return this._content;
     }
 
     get text() {
@@ -72,16 +204,25 @@ const Clipboard = GObject.registerClass({
         }
     }
 
+    _disconnectClipboard() {
+        if (this._clipboard && this._ownerChangeId > 0) {
+            this._clipboard.disconnect(this._ownerChangeId);
+            this._ownerChangeId = 0;
+        }
+
+        if (this._signalHandler) {
+            Gio.DBus.session.signal_unsubscribe(this._signalHandler);
+            this._signalHandler = 0;
+        }
+    }
+
     async _onNameAppeared(connection, name, name_owner) {
         try {
             // Cleanup the GtkClipboard
-            if (this._clipboard && this._ownerChangeId > 0) {
-                this._clipboard.disconnect(this._ownerChangeId);
-                this._ownerChangeId = 0;
-            }
+            this._disconnectClipboard();
 
             // Create a proxy for the remote clipboard
-            this._clipboard = new Gio.DBusProxy({
+            const clipboard = new Gio.DBusProxy({
                 g_bus_type: Gio.BusType.SESSION,
                 g_name: DBUS_NAME,
                 g_object_path: DBUS_PATH,
@@ -89,16 +230,17 @@ const Clipboard = GObject.registerClass({
                 g_flags: Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES,
             });
 
-            await this._clipboard.init_async(GLib.PRIORITY_DEFAULT,
+            await clipboard.init_async(GLib.PRIORITY_DEFAULT,
                 this._cancellable);
 
+            this._clipboard = clipboard;
             this._ownerChangeId = this._clipboard.connect('g-signal',
                 this._onOwnerChange.bind(this));
 
-            this._onOwnerChange();
             if (!globalThis.HAVE_GNOME) {
-                // Directly subscrible signal
-                this.signalHandler = Gio.DBus.session.signal_subscribe(
+                // The wl-clipboard watcher emits the signal from a separate
+                // connection, so subscribe to it directly
+                this._signalHandler = Gio.DBus.session.signal_subscribe(
                     null,
                     DBUS_NAME,
                     'OwnerChange',
@@ -109,6 +251,7 @@ const Clipboard = GObject.registerClass({
                 );
             }
 
+            this._onOwnerChange();
         } catch (e) {
             if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
                 debug(e);
@@ -118,10 +261,10 @@ const Clipboard = GObject.registerClass({
     }
 
     _onNameVanished(connection, name) {
-        if (this._clipboard && this._ownerChangeId > 0) {
-            this._clipboard.disconnect(this._ownerChangeId);
-            this._clipboardChangedId = 0;
-        }
+        if (this._cancellable.is_cancelled())
+            return;
+
+        this._disconnectClipboard();
 
         const display = Gdk.Display.get_default();
         this._clipboard = Gtk.Clipboard.get_default(display);
@@ -133,70 +276,238 @@ const Clipboard = GObject.registerClass({
     }
 
     async _onOwnerChange() {
-        try {
-            if (this._clipboard instanceof Gtk.Clipboard)
-                await this._gtkUpdateText();
+        const serial = ++this._serial;
 
+        try {
+            let content = null;
+
+            if (this._clipboard instanceof Gtk.Clipboard)
+                content = await this._gtkGetContent();
             else if (this._clipboard instanceof Gio.DBusProxy)
-                await this._proxyUpdateText();
+                content = await this._proxyGetContent();
+
+            // Ignore the result if the clipboard changed in the meantime
+            if (serial !== this._serial)
+                return;
+
+            this._applyUpdate(content);
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e);
         }
     }
 
-    _applyUpdate(text) {
-        if (typeof text !== 'string' || this.text === text)
-            return;
+    _applyUpdate(content) {
+        this._content = content;
+        this._image = null;
 
-        this._text = text;
-        this.notify('text');
+        // Non-text content is reported as empty text, so setting the same text
+        // again will replace it
+        const text = content?.type === 'text' ? content.text : '';
+
+        if (content !== null && this.text !== text) {
+            this._text = text;
+            this.notify('text');
+        }
+
+        if (content !== null)
+            this.emit('content-changed');
+    }
+
+    /**
+     * Get the current clipboard image as PNG data.
+     *
+     * The result is cached until the clipboard changes, so the image is only
+     * read and converted once, regardless of how many devices it is sent to.
+     *
+     * @returns {Promise<object|null>} An object with `bytes` (PNG data as
+     *   `GLib.Bytes`) and `checksum` (see {@link getImageChecksum}), or %null
+     *   if the clipboard does not contain an image
+     */
+    getImage() {
+        if (this._content?.type !== 'image')
+            return Promise.resolve(null);
+
+        if (this._image === null) {
+            const serial = this._serial;
+
+            this._image = this._readImage(this._content.mimetype).then(image => {
+                // Drop the result if the clipboard changed in the meantime
+                if (serial !== this._serial)
+                    return null;
+
+                return image;
+            });
+
+            this._image.catch(() => {
+                if (serial === this._serial)
+                    this._image = null;
+            });
+        }
+
+        return this._image;
+    }
+
+    async _readImage(mimetype) {
+        let pixbuf, bytes = null;
+
+        if (this._clipboard instanceof Gtk.Clipboard) {
+            pixbuf = await new Promise((resolve, reject) => {
+                this._clipboard.request_image((clipboard, image) => {
+                    resolve(image);
+                });
+            });
+
+            if (pixbuf === null)
+                throw new Error('Clipboard image not available');
+        } else if (this._clipboard instanceof Gio.DBusProxy) {
+            bytes = await this._proxyGetValue(mimetype);
+            pixbuf = decodeImage(bytes);
+        } else {
+            throw new Error('No clipboard available');
+        }
+
+        // Send PNG data as-is, otherwise convert it to PNG
+        if (mimetype !== 'image/png' || bytes === null)
+            bytes = encodePng(pixbuf);
+
+        return {
+            bytes: bytes,
+            checksum: getImageChecksum(pixbuf),
+        };
+    }
+
+    /**
+     * Set the clipboard content to an image.
+     *
+     * @param {GLib.Bytes} bytes - PNG data
+     */
+    setImage(bytes) {
+        if (this._clipboard instanceof Gtk.Clipboard)
+            this._clipboard.set_image(decodeImage(bytes));
+        else if (this._clipboard instanceof Gio.DBusProxy)
+            this._proxySetValue(bytes, 'image/png');
+
+    }
+
+    /**
+     * Set the clipboard content to a file.
+     *
+     * The GtkClipboard can not offer a file list from GJS, so the file path is
+     * offered as text in that case.
+     *
+     * @param {string} uri - A `file://` URI
+     */
+    setFile(uri) {
+        if (this._clipboard instanceof Gtk.Clipboard) {
+            const path = Gio.File.new_for_uri(uri).get_path();
+            this._clipboard.set_text(path, -1);
+        } else if (this._clipboard instanceof Gio.DBusProxy) {
+            const bytes = new GLib.Bytes(new TextEncoder().encode(`${uri}\r\n`));
+            this._proxySetValue(bytes, 'text/uri-list');
+        }
     }
 
     /*
      * Proxy Clipboard
      */
-    async _proxyUpdateText() {
+    async _proxyGetValue(mimetype) {
+        const reply = await this._clipboard.call('GetValue',
+            new GLib.Variant('(s)', [mimetype]),
+            Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
+
+        return reply.get_child_value(0).get_data_as_bytes();
+    }
+
+    _proxySetValue(bytes, mimetype) {
+        const parameters = GLib.Variant.new_tuple([
+            GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), bytes, true),
+            GLib.Variant.new_string(mimetype),
+        ]);
+
+        this._clipboard.call('SetValue', parameters,
+            Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable)
+            .catch(debug);
+    }
+
+    async _proxyGetContent() {
         let reply = await this._clipboard.call('GetMimetypes', null,
             Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
         const mimetypes = reply.deepUnpack()[0];
 
         // Special case for a cleared clipboard
         if (mimetypes.length === 0)
-            return this._applyUpdate('');
+            return {type: 'text', text: ''};
 
-        // Special case to ignore copied files
-        if (mimetypes.includes('text/uri-list'))
-            return;
+        // Copied files
+        if (mimetypes.includes('text/uri-list')) {
+            const bytes = await this._proxyGetValue('text/uri-list');
+            const [uri] = parseUriList(new TextDecoder().decode(bytes.toArray()));
 
-        reply = await this._clipboard.call('GetText', null,
-            Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
-        const text = reply.deepUnpack()[0];
+            if (uri !== undefined)
+                return {type: 'file', uri: uri};
+        }
 
-        this._applyUpdate(text);
+        // Only request text if it's available, to avoid needless transfers
+        if (TEXT_MIMETYPES.some(type => mimetypes.includes(type))) {
+            reply = await this._clipboard.call('GetText', null,
+                Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
+
+            return {type: 'text', text: reply.deepUnpack()[0]};
+        }
+
+        // Images are only read on demand, by getImage()
+        const mimetype = getImageMimetype(mimetypes);
+
+        if (mimetype !== undefined)
+            return {type: 'image', mimetype: mimetype};
+
+        return null;
     }
 
     /*
      * GtkClipboard
      */
-    async _gtkUpdateText() {
+    async _gtkGetContent() {
         const mimetypes = await new Promise((resolve, reject) => {
-            this._clipboard.request_targets((clipboard, atoms) => resolve(atoms));
+            this._clipboard.request_targets((clipboard, atoms) => {
+                resolve(atoms ?? []);
+            });
         });
 
         // Special case for a cleared clipboard
         if (mimetypes.length === 0)
-            return this._applyUpdate('');
+            return {type: 'text', text: ''};
 
-        // Special case to ignore copied files
-        if (mimetypes.includes('text/uri-list'))
-            return;
+        // Copied files
+        if (Gtk.targets_include_uri(mimetypes)) {
+            const uris = await new Promise((resolve, reject) => {
+                this._clipboard.request_uris((clipboard, uris) => {
+                    resolve(uris ?? []);
+                });
+            });
+            const uri = uris.find(u => GLib.uri_parse_scheme(u) === 'file');
 
-        const text = await new Promise((resolve, reject) => {
-            this._clipboard.request_text((clipboard, text) => resolve(text));
-        });
+            if (uri !== undefined)
+                return {type: 'file', uri: uri};
+        }
 
-        this._applyUpdate(text);
+        if (Gtk.targets_include_text(mimetypes)) {
+            const text = await new Promise((resolve, reject) => {
+                this._clipboard.request_text((clipboard, text) => resolve(text));
+            });
+
+            if (typeof text === 'string')
+                return {type: 'text', text: text};
+        }
+
+        // Images are only read on demand, by getImage()
+        if (Gtk.targets_include_image(mimetypes, false)) {
+            const mimetype = getImageMimetype(mimetypes) ?? 'image/png';
+            return {type: 'image', mimetype: mimetype};
+        }
+
+        return null;
     }
 
     destroy() {
@@ -204,19 +515,12 @@ const Clipboard = GObject.registerClass({
             return;
 
         this._cancellable.cancel();
-
-        if (this._clipboard && this._ownerChangeId > 0) {
-            this._clipboard.disconnect(this._ownerChangeId);
-            this._ownerChangedId = 0;
-        }
+        this._disconnectClipboard();
 
         if (this._nameWatcherId > 0) {
             Gio.bus_unwatch_name(this._nameWatcherId);
             this._nameWatcherId = 0;
         }
-
-        if (!globalThis.HAVE_GNOME && this.signalHandler)
-            Gio.DBus.session.signal_unsubscribe(this.signalHandler);
     }
 });
 

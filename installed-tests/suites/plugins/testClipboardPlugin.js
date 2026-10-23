@@ -2,7 +2,59 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+
 import * as Utils from '../fixtures/utils.js';
+
+import Config from '../config.js';
+const Core = await import(`file://${Config.PACKAGE_DATADIR}/service/core.js`);
+
+
+const CAPABILITIES = [
+    'kdeconnect.clipboard',
+    'kdeconnect.clipboard.connect',
+    'kdeconnect.clipboard.file',
+];
+
+
+/**
+ * Create a mock transfer, which copies a file to the download target.
+ *
+ * @param {Gio.File} source - The file to "download"
+ * @returns {object} A mock transfer
+ */
+function mockTransfer(source) {
+    return {
+        _items: [],
+        addFile(packet, file) {
+            this._items.push(file);
+        },
+        start() {
+            for (const file of this._items)
+                source.copy(file, Gio.FileCopyFlags.OVERWRITE, null, null);
+
+            return Promise.resolve();
+        },
+    };
+}
+
+
+/**
+ * Create a clipboard file packet with a payload.
+ *
+ * @param {string} filename - The filename
+ * @param {number} [size] - The payload size
+ * @returns {object} A packet
+ */
+function filePacket(filename, size = 1024) {
+    return new Core.Packet({
+        type: 'kdeconnect.clipboard.file',
+        body: {filename: filename},
+        payloadSize: size,
+        payloadTransferInfo: {port: 1739},
+    });
+}
 
 
 describe('The clipboard plugin', function () {
@@ -15,24 +67,12 @@ describe('The clipboard plugin', function () {
         testRig = new Utils.TestRig();
         await testRig.prepare({
             localDevice: {
-                incomingCapabilities: [
-                    'kdeconnect.clipboard',
-                    'kdeconnect.clipboard.connect',
-                ],
-                outgoingCapabilities: [
-                    'kdeconnect.clipboard',
-                    'kdeconnect.clipboard.connect',
-                ],
+                incomingCapabilities: CAPABILITIES,
+                outgoingCapabilities: CAPABILITIES,
             },
             remoteDevice: {
-                incomingCapabilities: [
-                    'kdeconnect.clipboard',
-                    'kdeconnect.clipboard.connect',
-                ],
-                outgoingCapabilities: [
-                    'kdeconnect.clipboard',
-                    'kdeconnect.clipboard.connect',
-                ],
+                incomingCapabilities: CAPABILITIES,
+                outgoingCapabilities: CAPABILITIES,
             },
         });
         testRig.setPaired(true);
@@ -109,6 +149,130 @@ describe('The clipboard plugin', function () {
 
         await remotePlugin.awaitPacket('kdeconnect.clipboard');
         expect(remotePlugin._clipboard.text).toBe('qux');
+    });
+
+    it('does not push the same text twice', async function () {
+        localPlugin._clipboard._setContent({type: 'text', text: 'qux'});
+
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('does not push a cleared clipboard', async function () {
+        localPlugin._clipboard.text = '';
+
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('pushes images as PNG files', async function () {
+        spyOn(localPlugin.device, 'createTransfer').and.callThrough();
+
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+
+        await remotePlugin.awaitPacket('kdeconnect.clipboard.file');
+        const [packet] = remotePlugin.handlePacket.calls.mostRecent().args;
+
+        expect(packet.body.filename).toMatch(/^[0-9]+\.png$/);
+        expect(packet.payloadSize).toBeGreaterThan(0);
+    });
+
+    it('does not push the same image twice', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+
+        // The re-encoded image has the same pixels
+        localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('pushes copied files', async function () {
+        localPlugin._clipboard.setFile(Utils.getDataUri('vcard-valid.vcf'));
+
+        await remotePlugin.awaitPacket('kdeconnect.clipboard.file', {
+            filename: 'vcard-valid.vcf',
+        });
+    });
+
+    it('pushes text after a file, even if unchanged', async function () {
+        localPlugin._clipboard.text = 'qux';
+
+        await remotePlugin.awaitPacket('kdeconnect.clipboard', {
+            content: 'qux',
+        });
+        expect(localPlugin._remoteContent).toEqual({type: 'text', text: 'qux'});
+    });
+
+    it('does not push directories', async function () {
+        localPlugin._clipboard.setFile(
+            Gio.File.new_for_path(Utils.getDataPath('album.png'))
+                .get_parent().get_uri());
+
+        // Wait for the asynchronous file query
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('receives images into the clipboard as images', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('album.png')));
+        spyOn(remotePlugin._clipboard, 'setImage').and.callThrough();
+        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('album.png'));
+
+        expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
+        expect(remotePlugin._clipboard.content.type).toBe('image');
+
+        // The received image must not be sent back
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('receives other files into the clipboard as files', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('../../contact.vcf'));
+
+        const dir = remotePlugin._getReceiveDirectory();
+        const uri = dir.get_child('contact.vcf').get_uri();
+        expect(remotePlugin._clipboard.setFile).toHaveBeenCalledWith(uri);
+
+        // Previously received files are removed
+        expect(dir.get_child('album.png').query_exists(null)).toBeFalse();
+
+        // The received file must not be sent back
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('rejects files that are too large', async function () {
+        spyOn(remotePlugin.device, 'createTransfer');
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket('big.bin', 100 * 1024 * 1024));
+
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+        expect(remotePlugin.device.createTransfer).not.toHaveBeenCalled();
+    });
+
+    it('rejects files when not allowed to pull content', async function () {
+        remotePlugin.settings.set_boolean('receive-content', false);
+        spyOn(remotePlugin.device, 'createTransfer');
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket('album.png'));
+
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+        expect(remotePlugin.device.createTransfer).not.toHaveBeenCalled();
+        remotePlugin.settings.set_boolean('receive-content', true);
     });
 
     it('disables its GActions when disconnected', function () {
