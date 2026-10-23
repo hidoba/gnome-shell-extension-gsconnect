@@ -120,6 +120,9 @@ const ClipboardPlugin = GObject.registerClass({
         this._outgoingTransfer = null;
         this._incomingTransfer = null;
 
+        // Directories of files being received, which must not be cleaned up
+        this._receivingDirs = new Set();
+
         // Serials, to ignore operations superseded by a clipboard change
         this._localSerial = 0;
         this._remoteSerial = 0;
@@ -202,7 +205,7 @@ const ClipboardPlugin = GObject.registerClass({
      * Recursively delete the contents of a directory.
      *
      * @param {Gio.File} dir - A directory
-     * @param {Gio.File} [keep] - A child to keep
+     * @param {function(Gio.File): boolean} [keep] - Selects children to keep
      */
     async _deleteChildren(dir, keep = null) {
         const iter = await dir.enumerate_children_async(
@@ -221,7 +224,7 @@ const ClipboardPlugin = GObject.registerClass({
                 for (const info of infos) {
                     const child = iter.get_child(info);
 
-                    if (keep !== null && child.equal(keep))
+                    if (keep?.(child))
                         continue;
 
                     try {
@@ -245,11 +248,12 @@ const ClipboardPlugin = GObject.registerClass({
      * Remove previously received files, which are no longer in the clipboard.
      *
      * @param {Gio.File} dir - The receive directory
-     * @param {Gio.File} keep - The directory of the current file
+     * @param {Gio.File} current - The directory of the current file
      */
-    async _cleanReceiveDirectory(dir, keep) {
+    async _cleanReceiveDirectory(dir, current) {
         try {
-            await this._deleteChildren(dir, keep);
+            await this._deleteChildren(dir, child => child.equal(current) ||
+                this._receivingDirs.has(child.get_path()));
         } catch (e) {
             if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
@@ -306,6 +310,7 @@ const ClipboardPlugin = GObject.registerClass({
             const receiveDir = this._getReceiveDirectory();
             dir = receiveDir.get_child(`${Date.now()}-${serial}`);
             dir.make_directory(null);
+            this._receivingDirs.add(dir.get_path());
 
             const file = dir.get_child(basename);
             const transfer = this.device.createTransfer();
@@ -331,6 +336,13 @@ const ClipboardPlugin = GObject.registerClass({
             // Remove previously received files, now that this one replaces
             // them in the clipboard
             await this._cleanReceiveDirectory(receiveDir, dir);
+
+            // Check again, since cleaning up is asynchronous
+            if (serial !== this._remoteSerial) {
+                await this._removeDirectory(dir);
+                return;
+            }
+
             this._onRemoteClipboardChanged(content);
         } catch (e) {
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
@@ -338,6 +350,9 @@ const ClipboardPlugin = GObject.registerClass({
 
             if (dir !== null)
                 await this._removeDirectory(dir);
+        } finally {
+            if (dir !== null)
+                this._receivingDirs.delete(dir.get_path());
         }
     }
 
@@ -368,15 +383,15 @@ const ClipboardPlugin = GObject.registerClass({
 
                 const [contents] = await file.load_contents_async(
                     this.cancellable);
-                const bytes = new GLib.Bytes(contents);
-                const pixbuf = await decodeImage(bytes, this.cancellable);
+                const pixbuf = await decodeImage(new GLib.Bytes(contents),
+                    this.cancellable);
 
+                // The image data is read again when applied, to avoid
+                // keeping it in memory
                 return {
                     type: 'image',
-                    bytes: mimetype === 'image/png'
-                        ? bytes
-                        : await encodePng(pixbuf, this.cancellable),
                     checksum: getImageChecksum(pixbuf),
+                    mimetype: mimetype,
                     uri: file.get_uri(),
                 };
             } catch (e) {
@@ -567,7 +582,9 @@ const ClipboardPlugin = GObject.registerClass({
             return;
         }
 
-        this._remoteContent = content;
+        // Only the checksum is kept, to avoid keeping the image in memory
+        const remoteContent = {type: 'image', checksum: content.checksum};
+        this._remoteContent = remoteContent;
         this._remoteBuffer = null;
 
         const transfer = this.device.createTransfer();
@@ -578,7 +595,7 @@ const ClipboardPlugin = GObject.registerClass({
             },
         }, Gio.MemoryInputStream.new_from_bytes(content.bytes), size);
 
-        await this._startTransfer(transfer, content);
+        await this._startTransfer(transfer, remoteContent);
     }
 
     async _sendFile(content, serial) {
@@ -645,10 +662,14 @@ const ClipboardPlugin = GObject.registerClass({
                 break;
 
             case 'image':
+                // Images sent to the device have no file to apply
+                if (content.uri === undefined)
+                    break;
+
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
-                this._clipboard.setImage(content.bytes);
                 this._pulledContent = content;
+                this._applyImage(content);
                 break;
 
             case 'file':
@@ -656,6 +677,31 @@ const ClipboardPlugin = GObject.registerClass({
                 this._localTimestamp = Date.now();
                 this._pulledContent = this._clipboard.setFile(content.uri);
                 break;
+        }
+    }
+
+    /**
+     * Place a received image in the clipboard as PNG data.
+     *
+     * @param {object} content - A received image
+     */
+    async _applyImage(content) {
+        try {
+            const file = Gio.File.new_for_uri(content.uri);
+            const [contents] = await file.load_contents_async(this.cancellable);
+            let bytes = new GLib.Bytes(contents);
+
+            if (content.mimetype !== 'image/png') {
+                const pixbuf = await decodeImage(bytes, this.cancellable);
+                bytes = await encodePng(pixbuf, this.cancellable);
+            }
+
+            // Ignore the image if the clipboard changed in the meantime
+            if (this._pulledContent === content)
+                this._clipboard.setImage(bytes);
+        } catch (e) {
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                debug(e, this.device.name);
         }
     }
 

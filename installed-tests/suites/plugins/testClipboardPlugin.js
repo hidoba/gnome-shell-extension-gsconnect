@@ -251,9 +251,11 @@ describe('The clipboard plugin', function () {
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
             mockTransfer(Utils.getDataFile('album.png')));
         spyOn(remotePlugin._clipboard, 'setImage').and.callThrough();
+        spyOn(remotePlugin, '_applyImage').and.callThrough();
         spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
 
         await remotePlugin._handleFile(filePacket('album.png'));
+        await remotePlugin._applyImage.calls.mostRecent().returnValue;
 
         expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
         await remotePlugin._clipboard.setImage.calls.mostRecent().returnValue;
