@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -9,6 +10,7 @@ import GObject from 'gi://GObject';
 import Config from '../../config.js';
 import * as Components from '../components/index.js';
 import {
+    MAX_IMAGE_PIXELS,
     decodeImage,
     encodePng,
     getImageChecksum
@@ -111,6 +113,12 @@ const ClipboardPlugin = GObject.registerClass({
         // The last content received from or sent to the device
         this._remoteContent = null;
 
+        // The last content applied to the local clipboard from the device
+        this._pulledContent = null;
+
+        // The pending transfer of a file or image to the device
+        this._outgoingTransfer = null;
+
         // Serials, to ignore operations superseded by a clipboard change
         this._localSerial = 0;
         this._remoteSerial = 0;
@@ -144,12 +152,12 @@ const ClipboardPlugin = GObject.registerClass({
     handlePacket(packet) {
         switch (packet.type) {
             case 'kdeconnect.clipboard':
-                if (packet.body.hasOwnProperty('content'))
+                if (typeof packet.body.content === 'string')
                     this._handleContent(packet);
                 break;
 
             case 'kdeconnect.clipboard.connect':
-                if (packet.body.hasOwnProperty('content'))
+                if (typeof packet.body.content === 'string')
                     this._handleConnectContent(packet);
                 break;
 
@@ -186,35 +194,70 @@ const ClipboardPlugin = GObject.registerClass({
     }
 
     /**
-     * Remove previously received files, which are no longer in the clipboard.
+     * Recursively delete the contents of a directory.
      *
-     * @param {Gio.File} dir - The receive directory
+     * @param {Gio.File} dir - A directory
      */
-    async _cleanReceiveDirectory(dir) {
-        try {
-            const iter = await dir.enumerate_children_async(
+    async _deleteChildren(dir) {
+        const iter = await dir.enumerate_children_async(
+            [
                 Gio.FILE_ATTRIBUTE_STANDARD_NAME,
-                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
-                GLib.PRIORITY_DEFAULT,
-                this.cancellable);
+                Gio.FILE_ATTRIBUTE_STANDARD_TYPE,
+            ].join(','),
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+            GLib.PRIORITY_DEFAULT,
+            this.cancellable);
 
+        try {
             let infos;
             while ((infos = await iter.next_files_async(10,
                 GLib.PRIORITY_DEFAULT, this.cancellable)).length > 0) {
                 for (const info of infos) {
+                    const child = iter.get_child(info);
+
                     try {
-                        await iter.get_child(info).delete_async(
-                            GLib.PRIORITY_DEFAULT, this.cancellable);
+                        if (info.get_file_type() === Gio.FileType.DIRECTORY)
+                            await this._deleteChildren(child);
+
+                        await child.delete_async(GLib.PRIORITY_DEFAULT,
+                            this.cancellable);
                     } catch (e) {
                         if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
                             throw e;
                     }
                 }
             }
-
+        } finally {
             iter.close(null);
+        }
+    }
+
+    /**
+     * Remove previously received files, which are no longer in the clipboard.
+     *
+     * @param {Gio.File} dir - The receive directory
+     */
+    async _cleanReceiveDirectory(dir) {
+        try {
+            await this._deleteChildren(dir);
         } catch (e) {
-            debug(e, this.device.name);
+            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                debug(e, this.device.name);
+        }
+    }
+
+    /**
+     * Remove a directory and its contents.
+     *
+     * @param {Gio.File} dir - A directory
+     */
+    async _removeDirectory(dir) {
+        try {
+            await this._deleteChildren(dir);
+            await dir.delete_async(GLib.PRIORITY_DEFAULT, null);
+        } catch (e) {
+            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                debug(e, this.device.name);
         }
     }
 
@@ -225,6 +268,11 @@ const ClipboardPlugin = GObject.registerClass({
             return;
         }
 
+        // The remote clipboard changed, regardless of the file being accepted
+        const serial = ++this._remoteSerial;
+        this._remoteContent = null;
+        this._remoteBuffer = null;
+
         // Only download files that will be applied to the clipboard
         if (!this.settings.get_boolean('receive-content') ||
             packet.payloadSize > MAX_FILE_SIZE) {
@@ -232,8 +280,7 @@ const ClipboardPlugin = GObject.registerClass({
             return;
         }
 
-        const serial = ++this._remoteSerial;
-        let file = null;
+        let dir = null;
 
         try {
             // Remote-supplied filename is untrusted; collapse to a basename so
@@ -243,10 +290,21 @@ const ClipboardPlugin = GObject.registerClass({
                 basename.includes('/'))
                 basename = 'unnamed-file';
 
-            const dir = this._getReceiveDirectory();
-            await this._cleanReceiveDirectory(dir);
-            file = dir.get_child(basename);
+            const receiveDir = this._getReceiveDirectory();
+            await this._cleanReceiveDirectory(receiveDir);
 
+            // Ignore files superseded while cleaning up
+            if (serial !== this._remoteSerial) {
+                this.device.rejectTransfer(packet);
+                return;
+            }
+
+            // Each file gets its own directory, so a superseded transfer can
+            // be removed without affecting a newer file of the same name
+            dir = receiveDir.get_child(`${Date.now()}-${serial}`);
+            dir.make_directory(null);
+
+            const file = dir.get_child(basename);
             const transfer = this.device.createTransfer();
             transfer.addFile(packet, file);
             await transfer.start(this.cancellable);
@@ -255,7 +313,7 @@ const ClipboardPlugin = GObject.registerClass({
 
             // Ignore files superseded by newer clipboard content
             if (serial !== this._remoteSerial) {
-                file.delete_async(GLib.PRIORITY_DEFAULT, null, null);
+                await this._removeDirectory(dir);
                 return;
             }
 
@@ -264,7 +322,8 @@ const ClipboardPlugin = GObject.registerClass({
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
 
-            file?.delete_async(GLib.PRIORITY_DEFAULT, null, null);
+            if (dir !== null)
+                await this._removeDirectory(dir);
         }
     }
 
@@ -286,6 +345,13 @@ const ClipboardPlugin = GObject.registerClass({
 
         if (mimetype?.startsWith('image/') && mimetype !== 'image/svg+xml') {
             try {
+                // Check the dimensions before decoding an untrusted image
+                const [format, width, height] =
+                    GdkPixbuf.Pixbuf.get_file_info(file.get_path());
+
+                if (format === null || width * height > MAX_IMAGE_PIXELS)
+                    throw new Error(`Unsupported image: ${width}x${height}`);
+
                 const [contents] = await file.load_contents_async(
                     this.cancellable);
                 const bytes = new GLib.Bytes(contents);
@@ -367,6 +433,30 @@ const ClipboardPlugin = GObject.registerClass({
     }
 
     /**
+     * Whether the device accepts files and images through the clipboard.
+     *
+     * @returns {boolean} %true if supported
+     */
+    _canSendFiles() {
+        if (!this.device.connected)
+            return false;
+
+        const incoming = this.device.settings.get_strv('incoming-capabilities');
+        return incoming.includes('kdeconnect.clipboard.file');
+    }
+
+    /**
+     * Cancel the pending transfer of a file or image, which has been
+     * superseded by newer clipboard content.
+     */
+    _cancelOutgoingTransfer() {
+        if (this._outgoingTransfer !== null) {
+            this._outgoingTransfer.cancel();
+            this._outgoingTransfer = null;
+        }
+    }
+
+    /**
      * Copy to the remote clipboard; called by _onLocalClipboardChanged()
      */
     async clipboardPush() {
@@ -386,8 +476,15 @@ const ClipboardPlugin = GObject.registerClass({
             if (isSameContent(content, this._remoteContent))
                 return;
 
+            // Don't send back content applied from the device
+            if (isSameContent(content, this._pulledContent))
+                return;
+
+            this._pulledContent = null;
+
             switch (content.type) {
                 case 'text':
+                    this._cancelOutgoingTransfer();
                     this._remoteContent = content;
                     this._remoteBuffer = content.text;
                     this.device.sendPacket({
@@ -403,7 +500,7 @@ const ClipboardPlugin = GObject.registerClass({
                     break;
 
                 case 'file':
-                    await this._sendFile(content);
+                    await this._sendFile(content, serial);
                     break;
             }
         } catch (e) {
@@ -413,6 +510,9 @@ const ClipboardPlugin = GObject.registerClass({
     }
 
     async _startTransfer(transfer, content) {
+        this._cancelOutgoingTransfer();
+        this._outgoingTransfer = transfer;
+
         try {
             await transfer.start(this.cancellable);
         } catch (e) {
@@ -421,11 +521,14 @@ const ClipboardPlugin = GObject.registerClass({
                 this._remoteContent = null;
 
             throw e;
+        } finally {
+            if (this._outgoingTransfer === transfer)
+                this._outgoingTransfer = null;
         }
     }
 
     async _sendImage(content) {
-        if (!this.device.connected)
+        if (!this._canSendFiles())
             return;
 
         const size = content.bytes.get_size();
@@ -449,8 +552,8 @@ const ClipboardPlugin = GObject.registerClass({
         await this._startTransfer(transfer, content);
     }
 
-    async _sendFile(content) {
-        if (!this.device.connected)
+    async _sendFile(content, serial) {
+        if (!this._canSendFiles())
             return;
 
         const file = Gio.File.new_for_uri(content.uri);
@@ -473,6 +576,10 @@ const ClipboardPlugin = GObject.registerClass({
                 this.device.name);
             return;
         }
+
+        // Ignore content superseded while querying the file
+        if (serial !== this._localSerial)
+            return;
 
         this._remoteContent = content;
         this._remoteBuffer = null;
@@ -505,23 +612,27 @@ const ClipboardPlugin = GObject.registerClass({
 
                     this._clipboard.text = content.text;
                 }
+                this._pulledContent = content;
                 break;
 
             case 'image':
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
                 this._clipboard.setImage(content.bytes);
+                this._pulledContent = content;
                 break;
 
             case 'file':
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
-                this._clipboard.setFile(content.uri);
+                this._pulledContent = this._clipboard.setFile(content.uri);
                 break;
         }
     }
 
     destroy() {
+        this._cancelOutgoingTransfer();
+
         if (this._clipboard && this._contentChangedId) {
             this._clipboard.disconnect(this._contentChangedId);
             this._clipboard = Components.release('clipboard');

@@ -79,7 +79,10 @@ const Component = GObject.registerClass({
     }
 
     setFile(uri) {
-        this._setContent({type: 'file', uri: uri});
+        const content = {type: 'file', uri: uri};
+        this._setContent(content);
+
+        return content;
     }
 });
 

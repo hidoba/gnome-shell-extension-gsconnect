@@ -66,6 +66,12 @@ function getImageMimetype(mimetypes) {
 
 
 /**
+ * The maximum number of pixels of a clipboard image, to limit memory use.
+ */
+export const MAX_IMAGE_PIXELS = 100 * 1000 * 1000;
+
+
+/**
  * Decode image data into a pixbuf.
  *
  * @param {GLib.Bytes} bytes - Encoded image data
@@ -73,12 +79,20 @@ function getImageMimetype(mimetypes) {
  */
 export function decodeImage(bytes) {
     const loader = new GdkPixbuf.PixbufLoader();
+    let tooLarge = false;
+
+    loader.connect('size-prepared', (_loader, width, height) => {
+        tooLarge = width * height > MAX_IMAGE_PIXELS;
+    });
 
     try {
         loader.write_bytes(bytes);
     } finally {
         loader.close();
     }
+
+    if (tooLarge)
+        throw new Error('Image is too large');
 
     const pixbuf = loader.get_pixbuf();
 
@@ -397,15 +411,23 @@ const Clipboard = GObject.registerClass({
      * offered as text in that case.
      *
      * @param {string} uri - A `file://` URI
+     * @returns {object|null} The content placed in the clipboard (see
+     *   {@link Clipboard.content}), or %null if no clipboard is available
      */
     setFile(uri) {
         if (this._clipboard instanceof Gtk.Clipboard) {
             const path = Gio.File.new_for_uri(uri).get_path();
             this._clipboard.set_text(path, -1);
+
+            return {type: 'text', text: path};
         } else if (this._clipboard instanceof Gio.DBusProxy) {
             const bytes = new GLib.Bytes(new TextEncoder().encode(`${uri}\r\n`));
             this._proxySetValue(bytes, 'text/uri-list');
+
+            return {type: 'file', uri: uri};
         }
+
+        return null;
     }
 
     /*

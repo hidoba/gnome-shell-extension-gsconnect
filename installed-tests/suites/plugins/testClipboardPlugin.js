@@ -208,13 +208,41 @@ describe('The clipboard plugin', function () {
     });
 
     it('does not push directories', async function () {
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+
         localPlugin._clipboard.setFile(
             Gio.File.new_for_path(Utils.getDataPath('album.png'))
                 .get_parent().get_uri());
 
         // Wait for the asynchronous file query
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
         expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('does not push files to devices without support', async function () {
+        const settings = localPlugin.device.settings;
+        const incoming = settings.get_strv('incoming-capabilities');
+        settings.set_strv('incoming-capabilities',
+            incoming.filter(type => type !== 'kdeconnect.clipboard.file'));
+        spyOn(localPlugin.device, 'createTransfer').and.callThrough();
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+
+        localPlugin._clipboard.setFile(Utils.getDataUri('album.png'));
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+
+        expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
+        settings.set_strv('incoming-capabilities', incoming);
+    });
+
+    it('ignores content that is not text', function () {
+        spyOn(remotePlugin, '_onRemoteClipboardChanged');
+
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard.connect',
+            body: {content: null, timestamp: Date.now()},
+        }));
+
+        expect(remotePlugin._onRemoteClipboardChanged).not.toHaveBeenCalled();
     });
 
     it('receives images into the clipboard as images', async function () {
@@ -241,12 +269,19 @@ describe('The clipboard plugin', function () {
 
         await remotePlugin._handleFile(filePacket('../../contact.vcf'));
 
+        // The file is saved in the receive directory, with a safe name
+        const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
+        const file = Gio.File.new_for_uri(uri);
         const dir = remotePlugin._getReceiveDirectory();
-        const uri = dir.get_child('contact.vcf').get_uri();
-        expect(remotePlugin._clipboard.setFile).toHaveBeenCalledWith(uri);
+        expect(file.get_basename()).toBe('contact.vcf');
+        expect(file.get_parent().get_parent().equal(dir)).toBeTrue();
+        expect(file.query_exists(null)).toBeTrue();
 
         // Previously received files are removed
-        expect(dir.get_child('album.png').query_exists(null)).toBeFalse();
+        const iter = dir.enumerate_children('standard::name',
+            Gio.FileQueryInfoFlags.NONE, null);
+        expect(iter.next_file(null)).not.toBeNull();
+        expect(iter.next_file(null)).toBeNull();
 
         // The received file must not be sent back
         await Promise.idle(GLib.PRIORITY_DEFAULT);
