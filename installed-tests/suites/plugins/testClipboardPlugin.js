@@ -118,7 +118,7 @@ describe('The clipboard plugin', function () {
         localPlugin.connected();
 
         await remotePlugin.awaitPacket('kdeconnect.clipboard.connect');
-        expect(remotePlugin._remoteBuffer).toBe('initial');
+        expect(remotePlugin._remoteContent.text).toBe('initial');
 
         localPlugin.settings.set_boolean('send-content', false);
     });
@@ -133,7 +133,7 @@ describe('The clipboard plugin', function () {
         localPlugin._clipboard.text = 'bar';
 
         await remotePlugin.awaitPacket('kdeconnect.clipboard');
-        expect(remotePlugin._remoteBuffer).toBe('bar');
+        expect(remotePlugin._remoteContent.text).toBe('bar');
     });
 
     it('will not pull content when not allowed', async function () {

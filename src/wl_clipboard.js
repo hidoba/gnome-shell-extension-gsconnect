@@ -122,7 +122,7 @@ export const Clipboard = GObject.registerClass(
                         const [, stdout] = proc.communicate_finish(res);
 
                         if (proc.get_successful())
-                            resolve(stdout ?? new GLib.Bytes(null));
+                            resolve(stdout);
                         else
                             reject(new Error(`wl-paste exited with ${proc.get_exit_status()}`));
                     } catch (e) {

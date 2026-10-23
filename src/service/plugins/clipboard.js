@@ -108,7 +108,6 @@ const ClipboardPlugin = GObject.registerClass({
         // Buffer content to allow selective sync
         this._localBuffer = this._clipboard.text;
         this._localTimestamp = 0;
-        this._remoteBuffer = null;
 
         // The last content received from or sent to the device
         this._remoteContent = null;
@@ -286,7 +285,6 @@ const ClipboardPlugin = GObject.registerClass({
         this._cancelIncomingTransfer();
         const serial = ++this._remoteSerial;
         this._remoteContent = null;
-        this._remoteBuffer = null;
 
         // Only download files that will be applied to the clipboard
         if (!this.settings.get_boolean('receive-content') ||
@@ -427,12 +425,8 @@ const ClipboardPlugin = GObject.registerClass({
      * Store the remote clipboard content and apply it if enabled
      */
     _onRemoteClipboardChanged(content) {
-        if (typeof content === 'string') {
+        if (typeof content === 'string')
             content = {type: 'text', text: content};
-            this._remoteBuffer = content.text;
-        } else {
-            this._remoteBuffer = null;
-        }
 
         // Supersede any file still being received
         if (content.type === 'text') {
@@ -530,7 +524,6 @@ const ClipboardPlugin = GObject.registerClass({
                 case 'text':
                     this._cancelOutgoingTransfer();
                     this._remoteContent = content;
-                    this._remoteBuffer = content.text;
                     this.device.sendPacket({
                         type: 'kdeconnect.clipboard',
                         body: {
@@ -585,7 +578,6 @@ const ClipboardPlugin = GObject.registerClass({
         // Only the checksum is kept, to avoid keeping the image in memory
         const remoteContent = {type: 'image', checksum: content.checksum};
         this._remoteContent = remoteContent;
-        this._remoteBuffer = null;
 
         const transfer = this.device.createTransfer();
         transfer.addStream({
@@ -628,7 +620,6 @@ const ClipboardPlugin = GObject.registerClass({
             return;
 
         this._remoteContent = content;
-        this._remoteBuffer = null;
 
         const transfer = this.device.createTransfer();
         transfer.addFile({
