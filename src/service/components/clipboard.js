@@ -95,6 +95,7 @@ const Clipboard = GObject.registerClass({
         this._content = null;
         this._image = null;
         this._serial = 0;
+        this._nameSerial = 0;
 
         this._ownerChangeId = 0;
         this._nameWatcherId = Gio.bus_watch_name(
@@ -160,6 +161,8 @@ const Clipboard = GObject.registerClass({
     }
 
     async _onNameAppeared(connection, name, name_owner) {
+        const nameSerial = ++this._nameSerial;
+
         try {
             // Cleanup the GtkClipboard
             this._disconnectClipboard();
@@ -175,6 +178,10 @@ const Clipboard = GObject.registerClass({
 
             await clipboard.init_async(GLib.PRIORITY_DEFAULT,
                 this._cancellable);
+
+            // Ignore the proxy if the name vanished in the meantime
+            if (nameSerial !== this._nameSerial)
+                return;
 
             this._clipboard = clipboard;
             this._ownerChangeId = this._clipboard.connect('g-signal',
@@ -206,6 +213,8 @@ const Clipboard = GObject.registerClass({
     _onNameVanished(connection, name) {
         if (this._cancellable.is_cancelled())
             return;
+
+        this._nameSerial++;
 
         this._disconnectClipboard();
 
@@ -305,14 +314,14 @@ const Clipboard = GObject.registerClass({
                 throw new Error('Clipboard image not available');
         } else if (this._clipboard instanceof Gio.DBusProxy) {
             bytes = await this._proxyGetValue(mimetype);
-            pixbuf = decodeImage(bytes);
+            pixbuf = await decodeImage(bytes, this._cancellable);
         } else {
             throw new Error('No clipboard available');
         }
 
         // Send PNG data as-is, otherwise convert it to PNG
         if (mimetype !== 'image/png' || bytes === null)
-            bytes = encodePng(pixbuf);
+            bytes = await encodePng(pixbuf, this._cancellable);
 
         return {
             bytes: bytes,
@@ -326,11 +335,16 @@ const Clipboard = GObject.registerClass({
      * @param {GLib.Bytes} bytes - PNG data
      */
     setImage(bytes) {
-        if (this._clipboard instanceof Gtk.Clipboard)
-            this._clipboard.set_image(decodeImage(bytes));
-        else if (this._clipboard instanceof Gio.DBusProxy)
-            this._proxySetValue(bytes, 'image/png');
+        if (this._clipboard instanceof Gtk.Clipboard) {
+            const clipboard = this._clipboard;
 
+            decodeImage(bytes, this._cancellable).then(pixbuf => {
+                if (this._clipboard === clipboard)
+                    clipboard.set_image(pixbuf);
+            }).catch(debug);
+        } else if (this._clipboard instanceof Gio.DBusProxy) {
+            this._proxySetValue(bytes, 'image/png');
+        }
     }
 
     /**

@@ -170,7 +170,7 @@ describe('The clipboard plugin', function () {
 
         const [, contents] = GLib.file_get_contents(
             Utils.getDataPath('album.png'));
-        localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+        await localPlugin._clipboard.setImage(new GLib.Bytes(contents));
 
         await remotePlugin.awaitPacket('kdeconnect.clipboard.file');
         const [packet] = remotePlugin.handlePacket.calls.mostRecent().args;
@@ -183,10 +183,12 @@ describe('The clipboard plugin', function () {
         const [, contents] = GLib.file_get_contents(
             Utils.getDataPath('album.png'));
 
-        // The re-encoded image has the same pixels
-        localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
 
-        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        // The re-encoded image has the same pixels
+        await localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
         expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
     });
 
@@ -254,6 +256,7 @@ describe('The clipboard plugin', function () {
         await remotePlugin._handleFile(filePacket('album.png'));
 
         expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
+        await remotePlugin._clipboard.setImage.calls.mostRecent().returnValue;
         expect(remotePlugin._clipboard.content.type).toBe('image');
 
         // The received image must not be sent back

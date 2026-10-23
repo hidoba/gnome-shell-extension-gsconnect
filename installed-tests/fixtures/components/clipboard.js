@@ -69,11 +69,11 @@ const Component = GObject.registerClass({
         return Promise.resolve(this._image);
     }
 
-    setImage(bytes) {
-        const pixbuf = decodeImage(bytes);
+    async setImage(bytes) {
+        const pixbuf = await decodeImage(bytes);
 
         this._setContent({type: 'image', mimetype: 'image/png'}, {
-            bytes: encodePng(pixbuf),
+            bytes: await encodePng(pixbuf),
             checksum: getImageChecksum(pixbuf),
         });
     }

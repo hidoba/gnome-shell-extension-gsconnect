@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -14,7 +13,8 @@ import {
     MAX_IMAGE_PIXELS,
     decodeImage,
     encodePng,
-    getImageChecksum
+    getImageChecksum,
+    getImageInfo
 } from '../utils/image.js';
 
 
@@ -130,6 +130,7 @@ const ClipboardPlugin = GObject.registerClass({
 
         // The remote clipboard may have changed while disconnected
         this._remoteContent = null;
+        this._pulledContent = null;
 
         // TODO: if we're not auto-syncing local->remote, but we are doing the
         //       reverse, it's possible older remote content will end up
@@ -285,7 +286,7 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Only download files that will be applied to the clipboard
         if (!this.settings.get_boolean('receive-content') ||
-            packet.payloadSize > MAX_FILE_SIZE) {
+            !(packet.payloadSize >= 0 && packet.payloadSize <= MAX_FILE_SIZE)) {
             this.device.rejectTransfer(packet);
             return;
         }
@@ -359,8 +360,8 @@ const ClipboardPlugin = GObject.registerClass({
         if (mimetype?.startsWith('image/') && mimetype !== 'image/svg+xml') {
             try {
                 // Check the dimensions before decoding an untrusted image
-                const [format, width, height] =
-                    GdkPixbuf.Pixbuf.get_file_info(file.get_path());
+                const [format, width, height] = await getImageInfo(file,
+                    this.cancellable);
 
                 if (format === null || width * height > MAX_IMAGE_PIXELS)
                     throw new Error(`Unsupported image: ${width}x${height}`);
@@ -368,11 +369,13 @@ const ClipboardPlugin = GObject.registerClass({
                 const [contents] = await file.load_contents_async(
                     this.cancellable);
                 const bytes = new GLib.Bytes(contents);
-                const pixbuf = decodeImage(bytes);
+                const pixbuf = await decodeImage(bytes, this.cancellable);
 
                 return {
                     type: 'image',
-                    bytes: mimetype === 'image/png' ? bytes : encodePng(pixbuf),
+                    bytes: mimetype === 'image/png'
+                        ? bytes
+                        : await encodePng(pixbuf, this.cancellable),
                     checksum: getImageChecksum(pixbuf),
                     uri: file.get_uri(),
                 };

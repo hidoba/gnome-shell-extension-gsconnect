@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import GdkPixbuf from 'gi://GdkPixbuf';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 
@@ -13,47 +14,78 @@ export const MAX_IMAGE_PIXELS = 100 * 1000 * 1000;
 
 
 /**
- * Decode image data into a pixbuf.
+ * Get the format and dimensions of an image file, without decoding it.
+ *
+ * @param {Gio.File} file - An image file
+ * @param {Gio.Cancellable} [cancellable] - A cancellable
+ * @returns {Promise<Array>} The format (or %null if unsupported), the width
+ *   and the height of the image
+ */
+export function getImageInfo(file, cancellable = null) {
+    return new Promise((resolve, reject) => {
+        GdkPixbuf.Pixbuf.get_file_info_async(file.get_path(), cancellable,
+            (_source, res) => {
+                try {
+                    resolve(GdkPixbuf.Pixbuf.get_file_info_finish(res));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+    });
+}
+
+
+/**
+ * Decode image data into a pixbuf, in a worker thread.
  *
  * @param {GLib.Bytes} bytes - Encoded image data
- * @returns {GdkPixbuf.Pixbuf} A pixbuf
+ * @param {Gio.Cancellable} [cancellable] - A cancellable
+ * @returns {Promise<GdkPixbuf.Pixbuf>} A pixbuf
  */
-export function decodeImage(bytes) {
-    const loader = new GdkPixbuf.PixbufLoader();
-    let tooLarge = false;
-
-    loader.connect('size-prepared', (_loader, width, height) => {
-        tooLarge = width * height > MAX_IMAGE_PIXELS;
+export async function decodeImage(bytes, cancellable = null) {
+    const stream = Gio.MemoryInputStream.new_from_bytes(bytes);
+    const pixbuf = await new Promise((resolve, reject) => {
+        GdkPixbuf.Pixbuf.new_from_stream_async(stream, cancellable,
+            (_source, res) => {
+                try {
+                    resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(res));
+                } catch (e) {
+                    reject(e);
+                }
+            });
     });
 
-    try {
-        loader.write_bytes(bytes);
-    } finally {
-        loader.close();
-    }
-
-    if (tooLarge)
+    if (pixbuf.width * pixbuf.height > MAX_IMAGE_PIXELS)
         throw new Error('Image is too large');
-
-    const pixbuf = loader.get_pixbuf();
-
-    if (pixbuf === null)
-        throw new Error('Failed to decode image');
 
     return pixbuf.apply_embedded_orientation() ?? pixbuf;
 }
 
 
 /**
- * Encode a pixbuf as PNG data.
+ * Encode a pixbuf as PNG data, in a worker thread.
  *
  * @param {GdkPixbuf.Pixbuf} pixbuf - A pixbuf
- * @returns {GLib.Bytes} PNG data
+ * @param {Gio.Cancellable} [cancellable] - A cancellable
+ * @returns {Promise<GLib.Bytes>} PNG data
  */
-export function encodePng(pixbuf) {
-    const [, buffer] = pixbuf.save_to_bufferv('png', [], []);
+export async function encodePng(pixbuf, cancellable = null) {
+    const stream = Gio.MemoryOutputStream.new_resizable();
 
-    return new GLib.Bytes(buffer);
+    await new Promise((resolve, reject) => {
+        pixbuf.save_to_streamv_async(stream, 'png', [], [], cancellable,
+            (_source, res) => {
+                try {
+                    resolve(GdkPixbuf.Pixbuf.save_to_stream_finish(res));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+    });
+
+    stream.close(null);
+
+    return stream.steal_as_bytes();
 }
 
 
@@ -70,9 +102,8 @@ export function getImageChecksum(pixbuf) {
     if (!pixbuf.has_alpha)
         pixbuf = pixbuf.add_alpha(false, 0, 0, 0);
 
-    const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
-    checksum.update(new TextEncoder().encode(`${pixbuf.width}x${pixbuf.height}:`));
-    checksum.update(pixbuf.read_pixel_bytes().toArray());
+    const pixels = GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256,
+        pixbuf.read_pixel_bytes());
 
-    return checksum.get_string();
+    return `${pixbuf.width}x${pixbuf.height}:${pixels}`;
 }
