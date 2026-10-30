@@ -8,10 +8,10 @@ import GLib from 'gi://GLib';
 
 
 /**
- * The maximum size of encoded image data, which is the same as the maximum
- * size of a file shared through the clipboard by KDE Connect.
+ * The maximum size of a file or image shared through the clipboard, which is
+ * the same as the default of KDE Connect.
  */
-export const MAX_IMAGE_SIZE = 50 * 1024 * 1024;
+export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 
 /**
@@ -45,14 +45,14 @@ export function getImageInfo(file, cancellable = null) {
 /**
  * Decode image data into a pixbuf, in a worker thread.
  *
- * Data larger than {@link MAX_IMAGE_SIZE} is rejected without being decoded.
+ * Data larger than {@link MAX_FILE_SIZE} is rejected without being decoded.
  *
  * @param {GLib.Bytes} bytes - Encoded image data
  * @param {Gio.Cancellable} [cancellable] - A cancellable
  * @returns {Promise<GdkPixbuf.Pixbuf>} A pixbuf
  */
 export async function decodeImage(bytes, cancellable = null) {
-    if (bytes.get_size() > MAX_IMAGE_SIZE)
+    if (bytes.get_size() > MAX_FILE_SIZE)
         throw new Error('Image is too large');
 
     const stream = Gio.MemoryInputStream.new_from_bytes(bytes);

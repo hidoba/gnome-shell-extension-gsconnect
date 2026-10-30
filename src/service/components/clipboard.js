@@ -103,7 +103,7 @@ const Clipboard = GObject.registerClass({
             settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
         });
         this._settingsChangedId = this._settings.connect(
-            'changed::clipboard-files', this._onOwnerChange.bind(this));
+            'changed::clipboard-files', this._onSettingsChanged.bind(this));
 
         this._ownerChangeId = 0;
         this._nameWatcherId = Gio.bus_watch_name(
@@ -235,7 +235,22 @@ const Clipboard = GObject.registerClass({
         this._onOwnerChange();
     }
 
-    async _onOwnerChange() {
+    _onOwnerChange() {
+        return this._update(true);
+    }
+
+    _onSettingsChanged() {
+        // Content already in the clipboard is not shared because of the
+        // setting changing, only when it is copied again
+        return this._update(false);
+    }
+
+    /**
+     * Update the content from the clipboard.
+     *
+     * @param {boolean} emit - Whether to emit `content-changed`
+     */
+    async _update(emit) {
         const serial = ++this._serial;
 
         try {
@@ -250,14 +265,14 @@ const Clipboard = GObject.registerClass({
             if (serial !== this._serial)
                 return;
 
-            this._applyUpdate(content);
+            this._applyUpdate(content, emit);
         } catch (e) {
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e);
         }
     }
 
-    _applyUpdate(content) {
+    _applyUpdate(content, emit) {
         this._content = content;
         this._image = null;
 
@@ -270,7 +285,7 @@ const Clipboard = GObject.registerClass({
             this.notify('text');
         }
 
-        if (content !== null)
+        if (content !== null && emit)
             this.emit('content-changed');
     }
 
@@ -321,7 +336,7 @@ const Clipboard = GObject.registerClass({
             if (pixbuf === null)
                 throw new Error('Clipboard image not available');
         } else if (this._clipboard instanceof Gio.DBusProxy) {
-            bytes = await this._proxyGetValue(mimetype);
+            bytes = await this._proxyGetValue(this._clipboard, mimetype);
             pixbuf = await decodeImage(bytes, this._cancellable);
         } else {
             throw new Error('No clipboard available');
@@ -384,8 +399,8 @@ const Clipboard = GObject.registerClass({
     /*
      * Proxy Clipboard
      */
-    async _proxyGetValue(mimetype) {
-        const reply = await this._clipboard.call('GetValue',
+    async _proxyGetValue(proxy, mimetype) {
+        const reply = await proxy.call('GetValue',
             new GLib.Variant('(s)', [mimetype]),
             Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
 
@@ -404,7 +419,10 @@ const Clipboard = GObject.registerClass({
     }
 
     async _proxyGetContent() {
-        let reply = await this._clipboard.call('GetMimetypes', null,
+        // Keep using the same proxy, even if it's replaced in the meantime
+        const proxy = this._clipboard;
+
+        let reply = await proxy.call('GetMimetypes', null,
             Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
         const mimetypes = reply.deepUnpack()[0];
 
@@ -419,7 +437,7 @@ const Clipboard = GObject.registerClass({
             if (!filesEnabled)
                 return null;
 
-            const bytes = await this._proxyGetValue('text/uri-list');
+            const bytes = await this._proxyGetValue(proxy, 'text/uri-list');
             const [uri] = parseUriList(new TextDecoder().decode(bytes.toArray()));
 
             if (uri !== undefined)
@@ -428,7 +446,7 @@ const Clipboard = GObject.registerClass({
 
         // Only request text if it's available, to avoid needless transfers
         if (TEXT_MIMETYPES.some(type => mimetypes.includes(type))) {
-            reply = await this._clipboard.call('GetText', null,
+            reply = await proxy.call('GetText', null,
                 Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
 
             return {type: 'text', text: reply.deepUnpack()[0]};

@@ -165,6 +165,25 @@ describe('The clipboard plugin', function () {
         expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
     });
 
+    it('only advertises sharing images and files when enabled', function () {
+        const service = new Core.ChannelService({id: 'test', name: 'test'});
+        const settings = localPlugin._serviceSettings;
+        const capability = 'kdeconnect.clipboard.file';
+
+        settings.set_boolean('clipboard-files', false);
+        service.buildIdentity();
+        expect(service.identity.body.incomingCapabilities).not.toContain(capability);
+        expect(service.identity.body.outgoingCapabilities).not.toContain(capability);
+        expect(service.identity.body.incomingCapabilities).toContain('kdeconnect.clipboard');
+
+        settings.set_boolean('clipboard-files', true);
+        service.buildIdentity();
+        expect(service.identity.body.incomingCapabilities).toContain(capability);
+        expect(service.identity.body.outgoingCapabilities).toContain(capability);
+
+        settings.set_boolean('clipboard-files', false);
+    });
+
     it('does not read images or files when sharing them is disabled', async function () {
         spyOn(localPlugin._clipboard, 'getImage').and.callThrough();
         spyOn(localPlugin, 'clipboardPush').and.callThrough();

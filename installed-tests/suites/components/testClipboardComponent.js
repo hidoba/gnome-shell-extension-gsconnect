@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import '../fixtures/utils.js';
+import * as Utils from '../fixtures/utils.js';
 
 import Gdk from 'gi://Gdk';
+import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 import GLib from 'gi://GLib';
 
@@ -55,5 +56,144 @@ describe('The Clipboard component', function () {
         });
 
         clipboard.text = text;
+    });
+});
+
+
+describe('The Clipboard component with a clipboard portal', function () {
+    const PNG = GLib.file_get_contents(Utils.getDataPath('album.png'));
+    let clipboard, portal;
+
+    /**
+     * Create a stand-in for the clipboard portal proxy, which records calls.
+     *
+     * @param {object} values - Clipboard content by mimetype
+     * @returns {Gio.DBusProxy} A proxy
+     */
+    function mockPortal(values) {
+        const proxy = new Gio.DBusProxy({
+            g_bus_type: Gio.BusType.SESSION,
+            g_name: 'org.gnome.Shell.Extensions.GSConnect.Clipboard',
+            g_object_path: '/org/gnome/Shell/Extensions/GSConnect/Clipboard',
+            g_interface_name: 'org.gnome.Shell.Extensions.GSConnect.Clipboard',
+        });
+        proxy.calls = [];
+        proxy.call = (method, params) => {
+            proxy.calls.push(method);
+
+            switch (method) {
+                case 'GetMimetypes':
+                    return Promise.resolve(new GLib.Variant('(as)',
+                        [Object.keys(values)]));
+
+                case 'GetText':
+                    return Promise.resolve(new GLib.Variant('(s)',
+                        [values['text/plain;charset=utf-8']]));
+
+                case 'GetValue': {
+                    const [mimetype] = params.deepUnpack();
+                    return Promise.resolve(new GLib.Variant('(ay)',
+                        [values[mimetype]]));
+                }
+            }
+
+            return Promise.reject(new Error(`Unexpected call: ${method}`));
+        };
+
+        return proxy;
+    }
+
+    beforeAll(async function () {
+        clipboard = new Clipboard();
+
+        // Let the component settle on a clipboard, then stop watching it so
+        // only the calls made by each test are recorded
+        await new Promise(resolve => setTimeout(resolve, 100));
+        clipboard._disconnectClipboard();
+    });
+
+    afterAll(function () {
+        clipboard._settings.set_boolean('clipboard-files', false);
+        clipboard.destroy();
+    });
+
+    beforeEach(function () {
+        clipboard._settings.set_boolean('clipboard-files', false);
+    });
+
+    it('only reads the mimetypes of images when sharing them is disabled', async function () {
+        portal = mockPortal({'image/png': PNG[1]});
+        clipboard._clipboard = portal;
+
+        await clipboard._onOwnerChange();
+
+        expect(clipboard.content).toBeNull();
+        expect(portal.calls).toEqual(['GetMimetypes']);
+    });
+
+    it('only reads the mimetypes of files when sharing them is disabled', async function () {
+        portal = mockPortal({
+            'text/uri-list': new TextEncoder().encode('file:///tmp/file\r\n'),
+            'text/plain;charset=utf-8': '/tmp/file',
+        });
+        clipboard._clipboard = portal;
+
+        await clipboard._onOwnerChange();
+
+        expect(clipboard.content).toBeNull();
+        expect(portal.calls).toEqual(['GetMimetypes']);
+    });
+
+    it('doesn\'t request text if none is offered', async function () {
+        clipboard._settings.set_boolean('clipboard-files', true);
+        portal = mockPortal({'image/png': PNG[1]});
+        clipboard._clipboard = portal;
+
+        await clipboard._onOwnerChange();
+
+        expect(clipboard.content).toEqual({type: 'image', mimetype: 'image/png'});
+        expect(portal.calls).toEqual(['GetMimetypes']);
+    });
+
+    it('reads an image once, when requested', async function () {
+        clipboard._settings.set_boolean('clipboard-files', true);
+        portal = mockPortal({'image/png': PNG[1]});
+        clipboard._clipboard = portal;
+
+        await clipboard._onOwnerChange();
+        const image = await clipboard.getImage();
+        await clipboard.getImage();
+
+        expect(image.bytes.get_size()).toBe(PNG[1].length);
+        expect(portal.calls).toEqual(['GetMimetypes', 'GetValue']);
+    });
+
+    it('detects copied files when sharing them is enabled', async function () {
+        clipboard._settings.set_boolean('clipboard-files', true);
+        portal = mockPortal({
+            'text/uri-list': new TextEncoder().encode('# comment\r\nfile:///tmp/file\r\n'),
+            'text/plain;charset=utf-8': '/tmp/file',
+        });
+        clipboard._clipboard = portal;
+
+        await clipboard._onOwnerChange();
+
+        expect(clipboard.content).toEqual({type: 'file', uri: 'file:///tmp/file'});
+    });
+
+    it('doesn\'t share content already copied when enabling sharing', async function () {
+        portal = mockPortal({'image/png': PNG[1]});
+        clipboard._clipboard = portal;
+        await clipboard._onOwnerChange();
+
+        const changed = jasmine.createSpy('content-changed');
+        const id = clipboard.connect('content-changed', changed);
+
+        clipboard._settings.set_boolean('clipboard-files', true);
+        await clipboard._onSettingsChanged();
+        clipboard.disconnect(id);
+
+        expect(clipboard.content).toEqual({type: 'image', mimetype: 'image/png'});
+        expect(changed).not.toHaveBeenCalled();
     });
 });

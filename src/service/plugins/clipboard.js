@@ -10,6 +10,7 @@ import Config from '../../config.js';
 import * as Components from '../components/index.js';
 import Plugin from '../plugin.js';
 import {
+    MAX_FILE_SIZE,
     MAX_IMAGE_PIXELS,
     decodeImage,
     encodePng,
@@ -32,6 +33,10 @@ export const Metadata = {
         'kdeconnect.clipboard.connect',
         'kdeconnect.clipboard.file',
     ],
+    // Images and files are only shared when enabled
+    capabilitySettings: {
+        'kdeconnect.clipboard.file': 'clipboard-files',
+    },
     actions: {
         clipboardPush: {
             label: _('Clipboard Push'),
@@ -51,13 +56,6 @@ export const Metadata = {
         },
     },
 };
-
-
-/**
- * The maximum size of a file or image shared through the clipboard. This is the
- * same as the default of KDE Connect.
- */
-const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 
 /**

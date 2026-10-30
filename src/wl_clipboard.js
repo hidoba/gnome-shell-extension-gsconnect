@@ -172,16 +172,24 @@ export const Clipboard = GObject.registerClass(
          * @returns {Promise<void>}
          */
         async GetTextAsync(params, invocation) {
-            const mimetypes = await this._getMimetypes();
-            const mimetype = TEXT_MIMETYPES.find(type => mimetypes.includes(type));
+            // Try the plain text types in order, rather than listing the
+            // offered types first, since the first one is usually offered
+            for (const mimetype of TEXT_MIMETYPES) {
+                let bytes;
 
-            if (mimetype === undefined)
-                throw new Error('text not available');
+                try {
+                    bytes = await this._wlPaste(['--no-newline', '--type',
+                        mimetype]);
+                } catch {
+                    continue;
+                }
 
-            const bytes = await this._wlPaste(['--no-newline', '--type', mimetype]);
-            const text = new TextDecoder().decode(bytes.toArray());
+                const text = new TextDecoder().decode(bytes.toArray());
+                invocation.return_value(new GLib.Variant('(s)', [text]));
+                return;
+            }
 
-            invocation.return_value(new GLib.Variant('(s)', [text]));
+            throw new Error('text not available');
         }
 
         /**

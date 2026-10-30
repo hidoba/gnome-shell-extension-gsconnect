@@ -205,11 +205,18 @@ const Manager = GObject.registerClass({
         this._name = value;
         this.notify('name');
 
-        // Broadcast changes to the network
-        for (const backend of this.backends.values()) {
+        for (const backend of this.backends.values())
             backend.name = this.name;
+
+        this._rebuildIdentity();
+    }
+
+    /**
+     * Rebuild the identity of each backend and broadcast it to the network.
+     */
+    _rebuildIdentity() {
+        for (const backend of this.backends.values())
             backend.buildIdentity();
-        }
 
         this.identify();
     }
@@ -245,6 +252,11 @@ const Manager = GObject.registerClass({
         this.settings.bind('debug', this, 'debug', 0);
         this.settings.bind('discoverable', this, 'discoverable', 0);
         this.settings.bind('name', this, 'name', 0);
+
+        // Settings that enable capabilities, which devices learn about when
+        // they next connect
+        this.settings.connect('changed::clipboard-files',
+            this._rebuildIdentity.bind(this));
     }
 
     _onDebugChanged(debug = false) {
