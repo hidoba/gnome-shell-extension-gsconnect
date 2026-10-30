@@ -18,6 +18,9 @@ The `hidoba` branch is upstream GSConnect plus:
 
 * **Clipboard images and files**: copying a file or an image shares it with
   connected devices, using KDE Connect's `kdeconnect.clipboard.file` packet.
+  * It's off by default. Turn on "Share images and files through the clipboard"
+    in the GSConnect preferences. While it's off, the clipboard behaves exactly
+    as in upstream GSConnect.
   * Copied images are sent as PNG, and copied files as-is, up to 50 MiB.
   * Received images are placed in the clipboard as images, ready to paste into
     applications. Other received files can be pasted as files, for example in
@@ -28,7 +31,7 @@ The `hidoba` branch is upstream GSConnect plus:
     files and images too.
 * **Fewer clipboard transfers** ([#2122][issue-2122]): text is only requested
   when the clipboard offers it, and image data is only read when it is sent to a
-  device.
+  device that supports it.
 * **Clipboard fixes**: the GNOME Shell portal's `GetValue` method works again,
   and text sync works again on other Wayland desktops (via `wl-clipboard`).
 * **Version 1000**, so that extensions.gnome.org never replaces the fork with
