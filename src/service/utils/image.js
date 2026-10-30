@@ -8,7 +8,14 @@ import GLib from 'gi://GLib';
 
 
 /**
- * The maximum number of pixels of a clipboard image, to limit memory use.
+ * The maximum size of encoded image data, which is the same as the maximum
+ * size of a file shared through the clipboard by KDE Connect.
+ */
+export const MAX_IMAGE_SIZE = 50 * 1024 * 1024;
+
+
+/**
+ * The maximum number of pixels of a received image, to limit memory use.
  */
 export const MAX_IMAGE_PIXELS = 100 * 1000 * 1000;
 
@@ -38,11 +45,16 @@ export function getImageInfo(file, cancellable = null) {
 /**
  * Decode image data into a pixbuf, in a worker thread.
  *
+ * Data larger than {@link MAX_IMAGE_SIZE} is rejected without being decoded.
+ *
  * @param {GLib.Bytes} bytes - Encoded image data
  * @param {Gio.Cancellable} [cancellable] - A cancellable
  * @returns {Promise<GdkPixbuf.Pixbuf>} A pixbuf
  */
 export async function decodeImage(bytes, cancellable = null) {
+    if (bytes.get_size() > MAX_IMAGE_SIZE)
+        throw new Error('Image is too large');
+
     const stream = Gio.MemoryInputStream.new_from_bytes(bytes);
     const pixbuf = await new Promise((resolve, reject) => {
         GdkPixbuf.Pixbuf.new_from_stream_async(stream, cancellable,
@@ -54,9 +66,6 @@ export async function decodeImage(bytes, cancellable = null) {
                 }
             });
     });
-
-    if (pixbuf.width * pixbuf.height > MAX_IMAGE_PIXELS)
-        throw new Error('Image is too large');
 
     return pixbuf.apply_embedded_orientation() ?? pixbuf;
 }

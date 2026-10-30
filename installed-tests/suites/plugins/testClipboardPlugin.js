@@ -165,7 +165,40 @@ describe('The clipboard plugin', function () {
         expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
     });
 
+    it('does not read images or files when sharing them is disabled', async function () {
+        spyOn(localPlugin._clipboard, 'getImage').and.callThrough();
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+
+        localPlugin._clipboard.setFile(Utils.getDataUri('vcard-valid.vcf'));
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+
+        expect(localPlugin._clipboard.getImage).not.toHaveBeenCalled();
+        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('rejects files when sharing them is disabled', async function () {
+        spyOn(remotePlugin.device, 'createTransfer');
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket('album.png'));
+
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+        expect(remotePlugin.device.createTransfer).not.toHaveBeenCalled();
+    });
+
     it('pushes images as PNG files', async function () {
+        // The setting is shared by both plugins
+        localPlugin._serviceSettings.set_boolean('clipboard-files', true);
+        localPlugin._clipboard.text = 'reset';
+        await remotePlugin.awaitPacket('kdeconnect.clipboard', {
+            content: 'reset',
+        });
+
         spyOn(localPlugin.device, 'createTransfer').and.callThrough();
 
         const [, contents] = GLib.file_get_contents(
@@ -227,12 +260,20 @@ describe('The clipboard plugin', function () {
         settings.set_strv('incoming-capabilities',
             incoming.filter(type => type !== 'kdeconnect.clipboard.file'));
         spyOn(localPlugin.device, 'createTransfer').and.callThrough();
+        spyOn(localPlugin._clipboard, 'getImage').and.callThrough();
         spyOn(localPlugin, 'clipboardPush').and.callThrough();
 
         localPlugin._clipboard.setFile(Utils.getDataUri('album.png'));
         await localPlugin.clipboardPush.calls.mostRecent().returnValue;
 
+        // Image data isn't even read
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await localPlugin._clipboard.setImage(new GLib.Bytes(contents));
+        await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+
         expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
+        expect(localPlugin._clipboard.getImage).not.toHaveBeenCalled();
         settings.set_strv('incoming-capabilities', incoming);
     });
 

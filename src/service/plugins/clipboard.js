@@ -99,6 +99,11 @@ const ClipboardPlugin = GObject.registerClass({
 
         this._clipboard = Components.acquire('clipboard');
 
+        // Sharing images and files is a global setting
+        this._serviceSettings = new Gio.Settings({
+            settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
+        });
+
         // Watch local clipboard for changes
         this._contentChangedId = this._clipboard.connect(
             'content-changed',
@@ -287,7 +292,8 @@ const ClipboardPlugin = GObject.registerClass({
         this._remoteContent = null;
 
         // Only download files that will be applied to the clipboard
-        if (!this.settings.get_boolean('receive-content') ||
+        if (!this._serviceSettings.get_boolean('clipboard-files') ||
+            !this.settings.get_boolean('receive-content') ||
             !(packet.payloadSize >= 0 && packet.payloadSize <= MAX_FILE_SIZE)) {
             this.device.rejectTransfer(packet);
             return;
@@ -465,6 +471,9 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {boolean} %true if supported
      */
     _canSendFiles() {
+        if (!this._serviceSettings.get_boolean('clipboard-files'))
+            return false;
+
         if (!this.device.connected)
             return false;
 
@@ -500,6 +509,12 @@ const ClipboardPlugin = GObject.registerClass({
     async clipboardPush() {
         // Don't sync if the clipboard is empty or unknown
         if (this._localTimestamp === 0)
+            return;
+
+        // Avoid reading images and files that can't be sent anyway
+        const type = this._clipboard.content?.type;
+
+        if (type !== undefined && type !== 'text' && !this._canSendFiles())
             return;
 
         try {

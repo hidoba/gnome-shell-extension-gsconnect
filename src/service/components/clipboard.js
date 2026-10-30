@@ -8,6 +8,7 @@ import Gtk from 'gi://Gtk';
 import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 
+import Config from '../../config.js';
 import {decodeImage, encodePng, getImageChecksum} from '../utils/image.js';
 
 
@@ -96,6 +97,13 @@ const Clipboard = GObject.registerClass({
         this._image = null;
         this._serial = 0;
         this._nameSerial = 0;
+
+        // Images and files are only looked for when enabled
+        this._settings = new Gio.Settings({
+            settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
+        });
+        this._settingsChangedId = this._settings.connect(
+            'changed::clipboard-files', this._onOwnerChange.bind(this));
 
         this._ownerChangeId = 0;
         this._nameWatcherId = Gio.bus_watch_name(
@@ -404,8 +412,13 @@ const Clipboard = GObject.registerClass({
         if (mimetypes.length === 0)
             return {type: 'text', text: ''};
 
-        // Copied files
+        const filesEnabled = this._settings.get_boolean('clipboard-files');
+
+        // Copied files are ignored, unless sharing them is enabled
         if (mimetypes.includes('text/uri-list')) {
+            if (!filesEnabled)
+                return null;
+
             const bytes = await this._proxyGetValue('text/uri-list');
             const [uri] = parseUriList(new TextDecoder().decode(bytes.toArray()));
 
@@ -424,7 +437,7 @@ const Clipboard = GObject.registerClass({
         // Images are only read on demand, by getImage()
         const mimetype = getImageMimetype(mimetypes);
 
-        if (mimetype !== undefined)
+        if (filesEnabled && mimetype !== undefined)
             return {type: 'image', mimetype: mimetype};
 
         return null;
@@ -444,8 +457,13 @@ const Clipboard = GObject.registerClass({
         if (mimetypes.length === 0)
             return {type: 'text', text: ''};
 
-        // Copied files
+        const filesEnabled = this._settings.get_boolean('clipboard-files');
+
+        // Copied files are ignored, unless sharing them is enabled
         if (Gtk.targets_include_uri(mimetypes)) {
+            if (!filesEnabled)
+                return null;
+
             const uris = await new Promise((resolve, reject) => {
                 this._clipboard.request_uris((clipboard, uris) => {
                     resolve(uris ?? []);
@@ -467,7 +485,7 @@ const Clipboard = GObject.registerClass({
         }
 
         // Images are only read on demand, by getImage()
-        if (Gtk.targets_include_image(mimetypes, false)) {
+        if (filesEnabled && Gtk.targets_include_image(mimetypes, false)) {
             const mimetype = getImageMimetype(mimetypes) ?? 'image/png';
             return {type: 'image', mimetype: mimetype};
         }
@@ -481,6 +499,11 @@ const Clipboard = GObject.registerClass({
 
         this._cancellable.cancel();
         this._disconnectClipboard();
+
+        if (this._settingsChangedId > 0) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = 0;
+        }
 
         if (this._nameWatcherId > 0) {
             Gio.bus_unwatch_name(this._nameWatcherId);
