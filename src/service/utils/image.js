@@ -17,7 +17,13 @@ export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 /**
  * The maximum number of pixels of a received image, to limit memory use.
  */
-export const MAX_IMAGE_PIXELS = 100 * 1000 * 1000;
+export const MAX_IMAGE_PIXELS = 50 * 1000 * 1000;
+
+
+/**
+ * The number of bytes hashed at a time, before yielding to the main loop.
+ */
+const CHECKSUM_CHUNK_SIZE = 4 * 1024 * 1024;
 
 
 /**
@@ -101,18 +107,35 @@ export async function encodePng(pixbuf, cancellable = null) {
 /**
  * Get a checksum for the pixel data of a pixbuf.
  *
- * This is used to recognize an image regardless of how it was encoded.
+ * This is used to recognize an image regardless of how it was encoded. The
+ * data is hashed in chunks, to avoid blocking the main loop for large images.
  *
  * @param {GdkPixbuf.Pixbuf} pixbuf - A pixbuf
- * @returns {string} A checksum
+ * @returns {Promise<string>} A checksum
  */
-export function getImageChecksum(pixbuf) {
+export async function getImageChecksum(pixbuf) {
     // Normalize to 8-bit RGBA, which has no padding between rows
     if (!pixbuf.has_alpha)
         pixbuf = pixbuf.add_alpha(false, 0, 0, 0);
 
-    const pixels = GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256,
-        pixbuf.read_pixel_bytes());
+    const pixels = pixbuf.read_pixel_bytes();
+    const size = pixels.get_size();
+    const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
 
-    return `${pixbuf.width}x${pixbuf.height}:${pixels}`;
+    for (let offset = 0; offset < size; offset += CHECKSUM_CHUNK_SIZE) {
+        if (offset > 0) {
+            await new Promise(resolve => {
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    resolve();
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+        }
+
+        const length = Math.min(CHECKSUM_CHUNK_SIZE, size - offset);
+        checksum.update(GLib.Bytes.new_from_bytes(pixels, offset, length)
+            .toArray());
+    }
+
+    return `${pixbuf.width}x${pixbuf.height}:${checksum.get_string()}`;
 }

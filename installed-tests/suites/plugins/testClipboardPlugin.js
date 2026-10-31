@@ -9,6 +9,8 @@ import * as Utils from '../fixtures/utils.js';
 
 import Config from '../config.js';
 const Core = await import(`file://${Config.PACKAGE_DATADIR}/service/core.js`);
+const {getImageChecksum} = await import(
+    `file://${Config.PACKAGE_DATADIR}/service/utils/image.js`);
 
 
 const CAPABILITIES = [
@@ -37,6 +39,48 @@ function mockTransfer(source) {
             return Promise.resolve();
         },
     };
+}
+
+
+/**
+ * Create a mock transfer, which doesn't complete until cancelled.
+ *
+ * @returns {object} A mock transfer
+ */
+function pendingTransfer() {
+    return {
+        addFile() {},
+        start() {
+            return new Promise((resolve, reject) => {
+                this.cancel = jasmine.createSpy('cancel').and.callFake(() => {
+                    reject(new Gio.IOErrorEnum({
+                        code: Gio.IOErrorEnum.CANCELLED,
+                        message: 'Cancelled',
+                    }));
+                });
+            });
+        },
+    };
+}
+
+
+/**
+ * List the names of the children of a directory.
+ *
+ * @param {Gio.File} dir - A directory
+ * @returns {string[]} The names of the children
+ */
+function listChildren(dir) {
+    const names = [];
+    const iter = dir.enumerate_children('standard::name',
+        Gio.FileQueryInfoFlags.NONE, null);
+
+    let info;
+    while ((info = iter.next_file(null)) !== null)
+        names.push(info.get_name());
+
+    iter.close(null);
+    return names;
 }
 
 
@@ -354,19 +398,7 @@ describe('The clipboard plugin', function () {
     });
 
     it('cancels receiving a file superseded by text', async function () {
-        const transfer = {
-            addFile() {},
-            start() {
-                return new Promise((resolve, reject) => {
-                    this.cancel = jasmine.createSpy('cancel').and.callFake(() => {
-                        reject(new Gio.IOErrorEnum({
-                            code: Gio.IOErrorEnum.CANCELLED,
-                            message: 'Cancelled',
-                        }));
-                    });
-                });
-            },
-        };
+        const transfer = pendingTransfer();
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
         spyOn(remotePlugin._clipboard, 'setFile');
 
@@ -382,6 +414,98 @@ describe('The clipboard plugin', function () {
         expect(transfer.cancel).toHaveBeenCalled();
         expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
         expect(remotePlugin._clipboard.text).toBe('newer');
+    });
+
+    it('cancels receiving a file superseded by a local copy', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin._clipboard, 'setFile');
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        remotePlugin._clipboard.text = 'copied locally';
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.text).toBe('copied locally');
+    });
+
+    it('removes a partially received file, even if destroyed', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+
+        const received = remotePlugin._handleFile(filePacket('partial.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        const [path] = remotePlugin._receivingDirs;
+
+        // Destroying the plugin cancels its operations
+        const cancellable = new Gio.Cancellable();
+        cancellable.cancel();
+        spyOnProperty(remotePlugin, 'cancellable').and.returnValue(cancellable);
+
+        transfer.cancel();
+        await received;
+
+        expect(Gio.File.new_for_path(path).query_exists(null)).toBeFalse();
+    });
+
+    it('cancels sending content superseded by the device', function () {
+        const transfer = {cancel: jasmine.createSpy('cancel')};
+        localPlugin._outgoingTransfer = transfer;
+
+        localPlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'from the device'},
+        }));
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(localPlugin._outgoingTransfer).toBeNull();
+    });
+
+    it('does not forward files received from a device', async function () {
+        const dir = localPlugin._getReceiveDirectory().get_child('forward');
+        dir.make_directory(null);
+        const file = dir.get_child('received.vcf');
+        Utils.getDataFile('vcard-valid.vcf').copy(file,
+            Gio.FileCopyFlags.NONE, null, null);
+        spyOn(localPlugin.device, 'createTransfer');
+
+        await localPlugin._sendFile({type: 'file', uri: file.get_uri()},
+            localPlugin._localSerial, localPlugin._remoteSerial);
+
+        expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
+        await localPlugin._removeDirectory(dir);
+    });
+
+    it('keeps only current files when clearing the cache', async function () {
+        const receiveDir = remotePlugin._getReceiveDirectory();
+        const current = remotePlugin._currentDir;
+        const stale = receiveDir.get_child('stale');
+        stale.make_directory(null);
+        stale.get_child('file').create(Gio.FileCreateFlags.NONE, null)
+            .close(null);
+
+        await remotePlugin.clearCache();
+
+        const names = listChildren(receiveDir);
+        expect(names).not.toContain('stale');
+
+        if (current !== null)
+            expect(names).toEqual([current.get_basename()]);
+    });
+
+    it('hashes large images in chunks', async function () {
+        const GdkPixbuf = (await import('gi://GdkPixbuf')).default;
+        const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8,
+            1200, 1000);
+        pixbuf.fill(0x12345678);
+
+        const expected = GLib.compute_checksum_for_bytes(
+            GLib.ChecksumType.SHA256, pixbuf.read_pixel_bytes());
+
+        expect(await getImageChecksum(pixbuf)).toBe(`1200x1000:${expected}`);
     });
 
     it('rejects files that are too large', async function () {
@@ -407,7 +531,16 @@ describe('The clipboard plugin', function () {
     });
 
     it('disables its GActions when disconnected', function () {
+        const incoming = {cancel: jasmine.createSpy('cancel')};
+        const outgoing = {cancel: jasmine.createSpy('cancel')};
+        localPlugin._incomingTransfer = incoming;
+        localPlugin._outgoingTransfer = outgoing;
+
         testRig.setConnected(false);
+
+        // Pending transfers are cancelled
+        expect(incoming.cancel).toHaveBeenCalled();
+        expect(outgoing.cancel).toHaveBeenCalled();
 
         expect(localPlugin.device.get_action_enabled('clipboardPush')).toBeFalse();
         expect(localPlugin.device.get_action_enabled('clipboardPull')).toBeFalse();

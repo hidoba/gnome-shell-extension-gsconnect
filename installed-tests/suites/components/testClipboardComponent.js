@@ -196,4 +196,32 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(clipboard.content).toEqual({type: 'image', mimetype: 'image/png'});
         expect(changed).not.toHaveBeenCalled();
     });
+
+    it('still reports a change superseded by enabling sharing', async function () {
+        portal = mockPortal({'text/plain;charset=utf-8': 'superseded'});
+        clipboard._clipboard = portal;
+
+        const changed = jasmine.createSpy('content-changed');
+        const id = clipboard.connect('content-changed', changed);
+
+        const ownerChange = clipboard._onOwnerChange();
+        const settingsChange = clipboard._onSettingsChanged();
+        await Promise.all([ownerChange, settingsChange]);
+        clipboard.disconnect(id);
+
+        expect(clipboard.content).toEqual({type: 'text', text: 'superseded'});
+        expect(changed).toHaveBeenCalledTimes(1);
+    });
+
+    it('recognizes an image it set without decoding it', async function () {
+        clipboard._settings.set_boolean('clipboard-files', true);
+        portal = mockPortal({'image/png': PNG[1]});
+        clipboard._clipboard = portal;
+
+        clipboard.setImage(new GLib.Bytes(PNG[1]), 'known-checksum');
+        await clipboard._onOwnerChange();
+        const image = await clipboard.getImage();
+
+        expect(image.checksum).toBe('known-checksum');
+    });
 });

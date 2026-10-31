@@ -98,6 +98,12 @@ const Clipboard = GObject.registerClass({
         this._serial = 0;
         this._nameSerial = 0;
 
+        // Whether a superseded update would have emitted `content-changed`
+        this._emitPending = false;
+
+        // The last image set, to recognize it without decoding it again
+        this._setImage = null;
+
         // Images and files are only looked for when enabled
         this._settings = new Gio.Settings({
             settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
@@ -253,6 +259,9 @@ const Clipboard = GObject.registerClass({
     async _update(emit) {
         const serial = ++this._serial;
 
+        // A change must still be reported if a newer update supersedes it
+        this._emitPending = this._emitPending || emit;
+
         try {
             let content = null;
 
@@ -265,8 +274,14 @@ const Clipboard = GObject.registerClass({
             if (serial !== this._serial)
                 return;
 
-            this._applyUpdate(content, emit);
+            const emitPending = this._emitPending;
+            this._emitPending = false;
+
+            this._applyUpdate(content, emitPending);
         } catch (e) {
+            if (serial === this._serial)
+                this._emitPending = false;
+
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e);
         }
@@ -275,6 +290,9 @@ const Clipboard = GObject.registerClass({
     _applyUpdate(content, emit) {
         this._content = content;
         this._image = null;
+
+        if (content?.type !== 'image')
+            this._setImage = null;
 
         // Non-text content is reported as empty text, so setting the same text
         // again will replace it
@@ -337,6 +355,15 @@ const Clipboard = GObject.registerClass({
                 throw new Error('Clipboard image not available');
         } else if (this._clipboard instanceof Gio.DBusProxy) {
             bytes = await this._proxyGetValue(this._clipboard, mimetype);
+
+            // Don't decode an image that was just set again
+            if (mimetype === 'image/png' && this._setImage?.bytes.equal(bytes)) {
+                const image = this._setImage;
+                this._setImage = null;
+
+                return image;
+            }
+
             pixbuf = await decodeImage(bytes, this._cancellable);
         } else {
             throw new Error('No clipboard available');
@@ -348,7 +375,7 @@ const Clipboard = GObject.registerClass({
 
         return {
             bytes: bytes,
-            checksum: getImageChecksum(pixbuf),
+            checksum: await getImageChecksum(pixbuf),
         };
     }
 
@@ -356,8 +383,12 @@ const Clipboard = GObject.registerClass({
      * Set the clipboard content to an image.
      *
      * @param {GLib.Bytes} bytes - PNG data
+     * @param {string} [checksum] - The checksum of the image, if known (see
+     *   {@link getImageChecksum})
      */
-    setImage(bytes) {
+    setImage(bytes, checksum = null) {
+        this._setImage = checksum !== null ? {bytes, checksum} : null;
+
         if (this._clipboard instanceof Gtk.Clipboard) {
             const clipboard = this._clipboard;
 

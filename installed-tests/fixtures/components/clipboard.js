@@ -74,7 +74,7 @@ const Component = GObject.registerClass({
 
         this._setContent({type: 'image', mimetype: 'image/png'}, {
             bytes: await encodePng(pixbuf),
-            checksum: getImageChecksum(pixbuf),
+            checksum: await getImageChecksum(pixbuf),
         });
     }
 
