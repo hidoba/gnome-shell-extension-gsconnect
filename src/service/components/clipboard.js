@@ -143,14 +143,15 @@ const Clipboard = GObject.registerClass({
     }
 
     set text(content) {
-        if (this.text === content)
-            return;
-
-        this._text = content;
-        this.notify('text');
-
         if (typeof content !== 'string')
             return;
+
+        // The text is set even if unchanged, since it may not be up to date
+        // with the clipboard yet
+        if (this.text !== content) {
+            this._text = content;
+            this.notify('text');
+        }
 
         if (this._clipboard instanceof Gtk.Clipboard)
             this._clipboard.set_text(content, -1);

@@ -95,6 +95,10 @@ describe('The Clipboard component with a clipboard portal', function () {
                     return Promise.resolve(new GLib.Variant('(ay)',
                         [values[mimetype]]));
                 }
+
+                case 'SetText':
+                case 'SetValue':
+                    return Promise.resolve(null);
             }
 
             return Promise.reject(new Error(`Unexpected call: ${method}`));
@@ -218,7 +222,8 @@ describe('The Clipboard component with a clipboard portal', function () {
         portal = mockPortal({'image/png': PNG[1]});
         clipboard._clipboard = portal;
 
-        clipboard.setImage(new GLib.Bytes(PNG[1]), 'known-checksum');
+        expect(await clipboard.setImage(new GLib.Bytes(PNG[1]),
+            'known-checksum')).toBeTrue();
         await clipboard._onOwnerChange();
         const image = await clipboard.getImage();
 
@@ -235,5 +240,15 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         expect(await result).toBeFalse();
         expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
+    });
+
+    it('sets text even if it seems unchanged', function () {
+        portal = mockPortal({});
+        clipboard._clipboard = portal;
+        clipboard._text = 'unchanged';
+
+        clipboard.text = 'unchanged';
+
+        expect(portal.calls).toEqual(['SetText']);
     });
 });

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 
 import Config from '../../config.js';
@@ -53,6 +54,19 @@ const Component = GObject.registerClass({
         this._setContent({type: 'text', text: content});
     }
 
+    /**
+     * Whether changes are reported asynchronously, like the real component.
+     *
+     * @type {boolean}
+     */
+    get async() {
+        return this._async ?? false;
+    }
+
+    set async(async) {
+        this._async = async;
+    }
+
     _setContent(content, image = null) {
         this._content = content;
         this._image = image;
@@ -62,7 +76,22 @@ const Component = GObject.registerClass({
             this.notify('text');
         }
 
-        this.emit('content-changed');
+        if (!this.async) {
+            this.emit('content-changed');
+            return;
+        }
+
+        // Report the content set after a delay, like a round trip to the
+        // session clipboard, even if changed again in the meantime
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
+            const current = [this._content, this._image];
+            this._content = content;
+            this._image = image;
+            this.emit('content-changed');
+            [this._content, this._image] = current;
+
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     getImage() {

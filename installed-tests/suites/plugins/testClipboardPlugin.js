@@ -549,11 +549,67 @@ describe('The clipboard plugin', function () {
             mockTransfer(svg));
         spyOn(remotePlugin._clipboard, 'setImage');
         spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+        spyOn(remotePlugin, '_loadImage').and.callThrough();
 
         await remotePlugin._handleFile(filePacket('drawing.svgz'));
 
+        // The data isn't even passed to an image loader
+        expect(remotePlugin._loadImage).not.toHaveBeenCalled();
         expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
         expect(remotePlugin._clipboard.setFile).toHaveBeenCalled();
+    });
+
+    it('receives TIFF images as files', async function () {
+        const tiff = tempFile('scan.tiff', path => {
+            const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                false, 8, 16, 16);
+            pixbuf.fill(0x996633ff);
+            pixbuf.savev(path, 'tiff', [], []);
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(tiff));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+        spyOn(remotePlugin, '_loadImage').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('scan.tiff'));
+
+        expect(remotePlugin._loadImage).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setFile).toHaveBeenCalled();
+    });
+
+    it('stops loading an image superseded by the device', async function () {
+        const image = tempFile('superseded.png', path => {
+            const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                false, 8, 64, 64);
+            pixbuf.fill(0x123456ff);
+            pixbuf.savev(path, 'png', [], []);
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(image));
+        spyOn(remotePlugin._clipboard, 'setImage');
+
+        const loadImage = remotePlugin._loadImage.bind(remotePlugin);
+        let path, result;
+        spyOn(remotePlugin, '_loadImage').and.callFake((...args) => {
+            [path] = remotePlugin._receivingDirs;
+
+            // Newer content arrives while the image is loading
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'during load'},
+            }));
+
+            const loading = loadImage(...args);
+            result = loading.catch(e => e);
+            return loading;
+        });
+
+        await remotePlugin._handleFile(filePacket('superseded.png'));
+        const error = await result;
+
+        expect(error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)).toBeTrue();
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
+        expect(Gio.File.new_for_path(path).query_exists(null)).toBeFalse();
     });
 
     it('shortens long names of received files', async function () {
@@ -614,6 +670,58 @@ describe('The clipboard plugin', function () {
         expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
     });
 
+    it('keeps a received file reported again by the clipboard', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('reported.vcf'));
+        const dir = remotePlugin._currentDir;
+        const content = remotePlugin._clipboard.content;
+
+        // A clipboard manager takes over the clipboard with the same content
+        remotePlugin._clipboard._setContent({...content});
+        await remotePlugin.clearCache();
+
+        expect(remotePlugin._currentDir).toBe(dir);
+        expect(dir.query_exists(null)).toBeTrue();
+        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+    });
+
+    it('recognizes contents applied in quick succession', async function () {
+        const image = tempFile('quick.png', path => {
+            const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                false, 8, 16, 16);
+            pixbuf.fill(0x654321ff);
+            pixbuf.savev(path, 'png', [], []);
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(image));
+        spyOn(remotePlugin, '_applyImage').and.callThrough();
+        remotePlugin._clipboard.async = true;
+
+        try {
+            await remotePlugin._handleFile(filePacket('quick.png'));
+            await remotePlugin._applyImage.calls.mostRecent().returnValue;
+
+            // Text arrives before the image is reported
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'right after the image'},
+            }));
+            const serial = remotePlugin._remoteSerial;
+            expect(remotePlugin._pendingEchoes.length).toBe(2);
+
+            await new Promise(resolve => setTimeout(resolve, 50));
+
+            // Neither is mistaken for a local copy
+            expect(remotePlugin._remoteSerial).toBe(serial);
+            expect(remotePlugin._pendingEchoes).toEqual([]);
+        } finally {
+            remotePlugin._clipboard.async = false;
+        }
+    });
+
     it('stops expecting an image that could not be applied', async function () {
         const content = {
             type: 'image',
@@ -626,7 +734,7 @@ describe('The clipboard plugin', function () {
         await remotePlugin._applyImage(content);
 
         expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
-        expect(remotePlugin._pendingEcho).toBeNull();
+        expect(remotePlugin._pendingEchoes).not.toContain(content);
     });
 
     it('does not replace a local image with the same image', async function () {

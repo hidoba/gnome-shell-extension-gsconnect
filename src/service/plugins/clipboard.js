@@ -10,12 +10,12 @@ import Config from '../../config.js';
 import * as Components from '../components/index.js';
 import Plugin from '../plugin.js';
 import {
-    IMAGE_FORMATS,
     MAX_FILE_SIZE,
     MAX_IMAGE_PIXELS,
     decodeImage,
     encodePng,
     getImageChecksum,
+    getImageFormat,
     getImageInfo
 } from '../utils/image.js';
 
@@ -83,6 +83,13 @@ function isSameContent(a, b) {
 
     return false;
 }
+
+
+/**
+ * The maximum number of contents applied from a device, which are expected to
+ * be reported as local clipboard changes.
+ */
+const MAX_PENDING_ECHOES = 4;
 
 
 /**
@@ -182,15 +189,18 @@ const ClipboardPlugin = GObject.registerClass({
         this._outgoingTransfer = null;
         this._incomingTransfer = null;
 
+        // Cancels receiving, loading and converting a file from the device
+        this._incomingCancellable = null;
+
         // Directories of files being received, which must not be cleaned up
         this._receivingDirs = new Set();
 
         // The directory of the received file in the clipboard, if any
         this._currentDir = null;
 
-        // Content applied from the device, which is yet to be reported as a
-        // local clipboard change
-        this._pendingEcho = null;
+        // Contents applied from the device, which are yet to be reported as
+        // local clipboard changes, oldest first
+        this._pendingEchoes = [];
 
         // Serials, to ignore operations superseded by a clipboard change
         this._localSerial = 0;
@@ -383,6 +393,11 @@ const ClipboardPlugin = GObject.registerClass({
         let dir = null;
         let started = false;
 
+        // Cancelled when superseded, or when the plugin is destroyed
+        const cancellable = new Gio.Cancellable();
+        const cancelledId = this.cancellable.connect(() => cancellable.cancel());
+        this._incomingCancellable = cancellable;
+
         try {
             const basename = getSafeBasename(packet.body.filename);
 
@@ -401,16 +416,16 @@ const ClipboardPlugin = GObject.registerClass({
             started = true;
 
             try {
-                await transfer.start(this.cancellable);
+                await transfer.start(cancellable);
             } finally {
                 if (this._incomingTransfer === transfer)
                     this._incomingTransfer = null;
             }
 
-            const content = await this._loadFile(file);
+            const content = await this._loadFile(file, cancellable);
 
             // Ignore files superseded by newer clipboard content
-            if (serial !== this._remoteSerial) {
+            if (serial !== this._remoteSerial || cancellable.is_cancelled()) {
                 await this._removeDirectory(dir);
                 return;
             }
@@ -434,6 +449,11 @@ const ClipboardPlugin = GObject.registerClass({
         } finally {
             if (dir !== null)
                 this._receivingDirs.delete(dir.get_path());
+
+            this.cancellable.disconnect(cancelledId);
+
+            if (this._incomingCancellable === cancellable)
+                this._incomingCancellable = null;
         }
     }
 
@@ -442,20 +462,17 @@ const ClipboardPlugin = GObject.registerClass({
      * clipboard as image data, while other files are placed as a file.
      *
      * @param {Gio.File} file - A received file
+     * @param {Gio.Cancellable} cancellable - A cancellable
      * @returns {Promise<object>} A clipboard content
      */
-    async _loadFile(file) {
-        const info = await file.query_info_async(
-            Gio.FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE,
-            Gio.FileQueryInfoFlags.NONE,
-            GLib.PRIORITY_DEFAULT,
-            this.cancellable);
-        const contentType = info.get_content_type();
-        const mimetype = Gio.content_type_get_mime_type(contentType);
+    async _loadFile(file, cancellable) {
+        // The name of the file is chosen by the device, so images are
+        // recognized from their contents, before passing them to a loader
+        const format = await getImageFormat(file, cancellable);
 
-        if (mimetype?.startsWith('image/')) {
+        if (format !== null) {
             try {
-                return await this._loadImage(file);
+                return await this._loadImage(file, format, cancellable);
             } catch (e) {
                 if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                     throw e;
@@ -474,40 +491,40 @@ const ClipboardPlugin = GObject.registerClass({
      * to the received file, so it doesn't have to be kept in memory.
      *
      * @param {Gio.File} file - A received image
+     * @param {string} format - The format of the image
+     * @param {Gio.Cancellable} cancellable - A cancellable
      * @returns {Promise<object>} A clipboard content
      */
-    async _loadImage(file) {
-        // The name of the file is chosen by the device, so the format and
-        // dimensions are checked from its contents before decoding it
-        const [format, width, height] = await getImageInfo(file,
-            this.cancellable);
-        const name = format?.get_name();
+    async _loadImage(file, format, cancellable) {
+        // Check the dimensions before decoding the image
+        const [info, width, height] = await getImageInfo(file, cancellable);
 
-        if (!Object.hasOwn(IMAGE_FORMATS, name))
-            throw new Error(`Unsupported image format: ${name}`);
+        if (info?.get_name() !== format)
+            throw new Error(`Unexpected image format: ${info?.get_name()}`);
 
         if (width * height > MAX_IMAGE_PIXELS)
             throw new Error(`Image is too large: ${width}x${height}`);
 
-        const [contents] = await file.load_contents_async(this.cancellable);
-        const pixbuf = await decodeImage(new GLib.Bytes(contents),
-            this.cancellable);
+        const [contents] = await file.load_contents_async(cancellable);
+        const pixbuf = await decodeImage(new GLib.Bytes(contents), cancellable);
+        cancellable.set_error_if_cancelled();
+
         let pngFile = file;
 
-        if (name !== 'png') {
-            const bytes = await encodePng(pixbuf, this.cancellable);
+        if (format !== 'png') {
+            const bytes = await encodePng(pixbuf, cancellable);
 
             if (bytes.get_size() > MAX_FILE_SIZE)
                 throw new Error('Image is too large once converted to PNG');
 
             pngFile = file.get_parent().get_child(`${file.get_basename()}.png`);
             await pngFile.replace_contents_bytes_async(bytes, null, false,
-                Gio.FileCreateFlags.PRIVATE, this.cancellable);
+                Gio.FileCreateFlags.PRIVATE, cancellable);
         }
 
         return {
             type: 'image',
-            checksum: await getImageChecksum(pixbuf),
+            checksum: await getImageChecksum(pixbuf, cancellable),
             uri: pngFile.get_uri(),
         };
     }
@@ -531,9 +548,14 @@ const ClipboardPlugin = GObject.registerClass({
         if (!this._isAppliedContent(content)) {
             this._cancelIncomingTransfer();
             this._remoteSerial++;
-            this._pulledContent = null;
-            this._pendingEcho = null;
-            this._currentDir = null;
+            this._pendingEchoes = [];
+
+            // Content applied from the device may be reported again, for
+            // example by a clipboard manager, and is still in the clipboard
+            if (!isSameContent(content, this._pulledContent)) {
+                this._pulledContent = null;
+                this._currentDir = null;
+            }
         }
 
         if (this.settings.get_boolean('send-content'))
@@ -548,23 +570,52 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {boolean} %true if the content was applied from the device
      */
     _isAppliedContent(content) {
-        const pending = this._pendingEcho;
-
-        if (pending === null)
-            return false;
-
         // Images are not read just to compare them, so the first image after
         // applying one is assumed to be it
-        const applied = content.type === 'image'
-            ? pending.type === 'image'
-            : isSameContent(content, pending);
+        const index = this._pendingEchoes.findIndex(pending => {
+            return content.type === 'image'
+                ? pending.type === 'image'
+                : isSameContent(content, pending);
+        });
 
         // Applied content is only reported once, so copying the same content
-        // again is a new change
-        if (applied)
-            this._pendingEcho = null;
+        // again is a new change. Content applied before it may not be
+        // reported at all, if superseded before it was read.
+        if (index !== -1)
+            this._pendingEchoes.splice(0, index + 1);
 
-        return applied;
+        return index !== -1;
+    }
+
+    /**
+     * Expect content applied from the device to be reported as a local
+     * clipboard change.
+     *
+     * @param {object} content - The content being applied
+     */
+    _expectEcho(content) {
+        this._pendingEchoes.push(content);
+
+        if (this._pendingEchoes.length > MAX_PENDING_ECHOES)
+            this._pendingEchoes.shift();
+    }
+
+    /**
+     * Stop expecting content to be reported, if it is still expected.
+     *
+     * @param {object} content - The content no longer being applied
+     * @param {object|null} [replacement] - What is expected instead
+     */
+    _unexpectEcho(content, replacement = null) {
+        const index = this._pendingEchoes.indexOf(content);
+
+        if (index === -1)
+            return;
+
+        if (replacement !== null)
+            this._pendingEchoes[index] = replacement;
+        else
+            this._pendingEchoes.splice(index, 1);
     }
 
     /*
@@ -646,6 +697,11 @@ const ClipboardPlugin = GObject.registerClass({
         if (this._incomingTransfer !== null) {
             this._incomingTransfer.cancel();
             this._incomingTransfer = null;
+        }
+
+        if (this._incomingCancellable !== null) {
+            this._incomingCancellable.cancel();
+            this._incomingCancellable = null;
         }
     }
 
@@ -832,7 +888,7 @@ const ClipboardPlugin = GObject.registerClass({
                     this._localBuffer = content.text;
                     this._localTimestamp = Date.now();
 
-                    this._pendingEcho = content;
+                    this._expectEcho(content);
                     this._clipboard.text = content.text;
                 }
                 break;
@@ -852,14 +908,12 @@ const ClipboardPlugin = GObject.registerClass({
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
                 this._pulledContent = content;
-                this._pendingEcho = content;
+                this._expectEcho(content);
 
                 // The clipboard may hold the file in another form
                 const applied = this._clipboard.setFile(content.uri);
                 this._pulledContent = applied;
-
-                if (this._pendingEcho === content)
-                    this._pendingEcho = applied;
+                this._unexpectEcho(content, applied);
                 break;
             }
         }
@@ -891,15 +945,14 @@ const ClipboardPlugin = GObject.registerClass({
             if (this._pulledContent !== content || serial !== this._remoteSerial)
                 return;
 
-            this._pendingEcho = content;
+            this._expectEcho(content);
             const applied = await this._clipboard.setImage(
                 new GLib.Bytes(contents), content.checksum);
 
-            if (!applied && this._pendingEcho === content)
-                this._pendingEcho = null;
+            if (!applied)
+                this._unexpectEcho(content);
         } catch (e) {
-            if (this._pendingEcho === content)
-                this._pendingEcho = null;
+            this._unexpectEcho(content);
 
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
