@@ -255,8 +255,8 @@ const Manager = GObject.registerClass({
 
         // Settings that enable capabilities, which devices learn about when
         // they next connect
-        this.settings.connect('changed::clipboard-files',
-            this._rebuildIdentity.bind(this));
+        this._clipboardFilesChangedId = this.settings.connect(
+            'changed::clipboard-files', this._rebuildIdentity.bind(this));
     }
 
     _onDebugChanged(debug = false) {
@@ -564,6 +564,11 @@ const Manager = GObject.registerClass({
     destroy() {
         this.stop();
         this.set_connection(null);
+
+        if (this._clipboardFilesChangedId) {
+            this.settings.disconnect(this._clipboardFilesChangedId);
+            this._clipboardFilesChangedId = 0;
+        }
     }
 });
 

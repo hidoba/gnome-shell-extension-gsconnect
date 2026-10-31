@@ -385,20 +385,31 @@ const Clipboard = GObject.registerClass({
      * @param {GLib.Bytes} bytes - PNG data
      * @param {string} [checksum] - The checksum of the image, if known (see
      *   {@link getImageChecksum})
+     * @returns {Promise<boolean>} %true if the image was set, or %false if the
+     *   clipboard changed before it could be
      */
-    setImage(bytes, checksum = null) {
+    async setImage(bytes, checksum = null) {
         this._setImage = checksum !== null ? {bytes, checksum} : null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const clipboard = this._clipboard;
+            const serial = this._serial;
+            const pixbuf = await decodeImage(bytes, this._cancellable);
 
-            decodeImage(bytes, this._cancellable).then(pixbuf => {
-                if (this._clipboard === clipboard)
-                    clipboard.set_image(pixbuf);
-            }).catch(debug);
+            // Don't replace content copied while decoding
+            if (this._clipboard !== clipboard || serial !== this._serial)
+                return false;
+
+            clipboard.set_image(pixbuf);
+            return true;
         } else if (this._clipboard instanceof Gio.DBusProxy) {
-            this._proxySetValue(bytes, 'image/png');
+            await this._clipboard.call('SetValue',
+                this._createValue(bytes, 'image/png'),
+                Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
+            return true;
         }
+
+        return false;
     }
 
     /**
@@ -438,13 +449,15 @@ const Clipboard = GObject.registerClass({
         return reply.get_child_value(0).get_data_as_bytes();
     }
 
-    _proxySetValue(bytes, mimetype) {
-        const parameters = GLib.Variant.new_tuple([
+    _createValue(bytes, mimetype) {
+        return GLib.Variant.new_tuple([
             GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), bytes, true),
             GLib.Variant.new_string(mimetype),
         ]);
+    }
 
-        this._clipboard.call('SetValue', parameters,
+    _proxySetValue(bytes, mimetype) {
+        this._clipboard.call('SetValue', this._createValue(bytes, mimetype),
             Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable)
             .catch(debug);
     }
@@ -469,7 +482,11 @@ const Clipboard = GObject.registerClass({
                 return null;
 
             const bytes = await this._proxyGetValue(proxy, 'text/uri-list');
-            const [uri] = parseUriList(new TextDecoder().decode(bytes.toArray()));
+            const uris = parseUriList(new TextDecoder().decode(bytes.toArray()));
+            const [uri] = uris;
+
+            if (uris.length > 1)
+                debug(`Only sharing the first of ${uris.length} copied files`);
 
             if (uri !== undefined)
                 return {type: 'file', uri: uri};
@@ -518,7 +535,11 @@ const Clipboard = GObject.registerClass({
                     resolve(uris ?? []);
                 });
             });
-            const uri = uris.find(u => GLib.uri_parse_scheme(u) === 'file');
+            const files = uris.filter(u => GLib.uri_parse_scheme(u) === 'file');
+            const [uri] = files;
+
+            if (files.length > 1)
+                debug(`Only sharing the first of ${files.length} copied files`);
 
             if (uri !== undefined)
                 return {type: 'file', uri: uri};

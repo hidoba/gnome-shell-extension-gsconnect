@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
@@ -81,6 +82,21 @@ function listChildren(dir) {
 
     iter.close(null);
     return names;
+}
+
+
+/**
+ * Write a file in a new temporary directory.
+ *
+ * @param {string} name - The file name
+ * @param {function(string)} write - Writes the file at a path
+ * @returns {Gio.File} The file
+ */
+function tempFile(name, write) {
+    const path = GLib.build_filenamev([GLib.dir_make_tmp(null), name]);
+    write(path);
+
+    return Gio.File.new_for_path(path);
 }
 
 
@@ -481,23 +497,158 @@ describe('The clipboard plugin', function () {
 
     it('keeps only current files when clearing the cache', async function () {
         const receiveDir = remotePlugin._getReceiveDirectory();
-        const current = remotePlugin._currentDir;
-        const stale = receiveDir.get_child('stale');
-        stale.make_directory(null);
-        stale.get_child('file').create(Gio.FileCreateFlags.NONE, null)
-            .close(null);
+        const previous = remotePlugin._currentDir;
+
+        for (const name of ['current', 'receiving', 'stale']) {
+            const dir = receiveDir.get_child(name);
+            dir.make_directory(null);
+            dir.get_child('file').create(Gio.FileCreateFlags.NONE, null)
+                .close(null);
+        }
+
+        remotePlugin._currentDir = receiveDir.get_child('current');
+        remotePlugin._receivingDirs.add(
+            receiveDir.get_child('receiving').get_path());
 
         await remotePlugin.clearCache();
 
-        const names = listChildren(receiveDir);
-        expect(names).not.toContain('stale');
+        expect(listChildren(receiveDir).sort()).toEqual(['current', 'receiving']);
 
-        if (current !== null)
-            expect(names).toEqual([current.get_basename()]);
+        remotePlugin._currentDir = previous;
+        remotePlugin._receivingDirs.clear();
+        await remotePlugin.clearCache();
+    });
+
+    it('checks the format of received images from their contents', async function () {
+        // JPEG data named as PNG is converted, rather than offered as PNG
+        const jpeg = tempFile('photo.png', path => {
+            const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                false, 8, 16, 16);
+            pixbuf.fill(0x336699ff);
+            pixbuf.savev(path, 'jpeg', [], []);
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(jpeg));
+        spyOn(remotePlugin._clipboard, 'setImage').and.callThrough();
+        spyOn(remotePlugin, '_applyImage').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('photo.png'));
+        await remotePlugin._applyImage.calls.mostRecent().returnValue;
+
+        const [bytes] = remotePlugin._clipboard.setImage.calls.mostRecent().args;
+        const signature = bytes.toArray().slice(0, 4);
+        expect(Array.from(signature)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    });
+
+    it('receives images in other formats as files', async function () {
+        const svg = tempFile('drawing.svgz', path => {
+            GLib.file_set_contents(path, '<svg xmlns="http://www.w3.org/2000/svg" ' +
+                'width="16" height="16"><rect width="16" height="16"/></svg>');
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(svg));
+        spyOn(remotePlugin._clipboard, 'setImage');
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('drawing.svgz'));
+
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setFile).toHaveBeenCalled();
+    });
+
+    it('shortens long names of received files', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket(`${'é'.repeat(300)}.vcf`));
+
+        const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
+        const name = Gio.File.new_for_uri(uri).get_basename();
+        expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(200);
+        expect(name).toMatch(/^é+\.vcf$/);
+    });
+
+    it('rejects a file that can\'t be received', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.throwError('Failed');
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket('failed.bin'));
+
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+    });
+
+    it('cancels receiving a file when the same text is copied again', async function () {
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'copied twice'},
+        }));
+        expect(remotePlugin._clipboard.text).toBe('copied twice');
+
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        remotePlugin._clipboard._setContent({type: 'text', text: 'copied twice'});
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
+    });
+
+    it('does not apply an image superseded by the device', async function () {
+        const content = {
+            type: 'image',
+            checksum: 'superseded',
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = content;
+        spyOn(remotePlugin._clipboard, 'setImage');
+
+        // A newer file starts being received while the image is read
+        const applied = remotePlugin._applyImage(content);
+        remotePlugin._remoteSerial++;
+        await applied;
+
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
+    });
+
+    it('stops expecting an image that could not be applied', async function () {
+        const content = {
+            type: 'image',
+            checksum: 'not applied',
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = content;
+        spyOn(remotePlugin._clipboard, 'setImage').and.resolveTo(false);
+
+        await remotePlugin._applyImage(content);
+
+        expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
+        expect(remotePlugin._pendingEcho).toBeNull();
+    });
+
+    it('does not replace a local image with the same image', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+        const local = await remotePlugin._clipboard.getImage();
+
+        const content = {
+            type: 'image',
+            checksum: local.checksum,
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = content;
+        spyOn(remotePlugin._clipboard, 'setImage');
+
+        await remotePlugin._applyImage(content);
+
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
     });
 
     it('hashes large images in chunks', async function () {
-        const GdkPixbuf = (await import('gi://GdkPixbuf')).default;
         const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8,
             1200, 1000);
         pixbuf.fill(0x12345678);

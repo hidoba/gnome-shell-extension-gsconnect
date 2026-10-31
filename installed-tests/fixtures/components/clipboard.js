@@ -76,6 +76,8 @@ const Component = GObject.registerClass({
             bytes: await encodePng(pixbuf),
             checksum: await getImageChecksum(pixbuf),
         });
+
+        return true;
     }
 
     setFile(uri) {

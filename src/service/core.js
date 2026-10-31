@@ -415,9 +415,13 @@ export const ChannelService = GObject.registerClass({
         });
 
         // Capabilities may depend on a boolean setting of the service
-        const settings = new Gio.Settings({
-            settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
-        });
+        if (this._serviceSettings === undefined) {
+            this._serviceSettings = new Gio.Settings({
+                settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
+            });
+        }
+
+        const settings = this._serviceSettings;
         const isEnabled = (meta, type) => {
             const key = meta.capabilitySettings?.[type];
             return key === undefined || settings.get_boolean(key);

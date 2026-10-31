@@ -17,7 +17,21 @@ export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 /**
  * The maximum number of pixels of a received image, to limit memory use.
  */
-export const MAX_IMAGE_PIXELS = 50 * 1000 * 1000;
+export const MAX_IMAGE_PIXELS = 25 * 1000 * 1000;
+
+
+/**
+ * The image formats accepted from devices, by GdkPixbuf format name, with
+ * their mimetypes. Other formats are received as files.
+ */
+export const IMAGE_FORMATS = {
+    png: 'image/png',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    bmp: 'image/bmp',
+    tiff: 'image/tiff',
+};
 
 
 /**

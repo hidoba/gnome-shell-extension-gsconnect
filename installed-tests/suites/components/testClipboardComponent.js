@@ -224,4 +224,16 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         expect(image.checksum).toBe('known-checksum');
     });
+
+    it('doesn\'t set an image if the clipboard changes while decoding', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        spyOn(clipboard._clipboard, 'set_image');
+
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]));
+        clipboard._serial++;
+
+        expect(await result).toBeFalse();
+        expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
+    });
 });
