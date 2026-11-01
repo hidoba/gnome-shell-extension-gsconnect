@@ -194,37 +194,53 @@ export async function getImageChecksum(pixbuf, cancellable = null) {
     const {width, height, rowstride} = pixbuf;
     const channels = pixbuf.n_channels;
     const rowLength = width * channels * pixbuf.bits_per_sample / 8;
-    const pixels = pixbuf.read_pixel_bytes();
+    const pixels = pixbuf.read_pixel_bytes().toArray();
     const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
 
-    // Rows without padding are hashed as a whole
-    const rows = rowstride === rowLength
-        ? [[0, rowLength * height]]
-        : Array.from({length: height}, (_, y) => [y * rowstride, rowLength]);
+    // Rows are copied into a buffer without their padding, which is hashed
+    // each time it's full, so the cost doesn't depend on the number of rows
+    const buffer = new Uint8Array(CHECKSUM_CHUNK_SIZE);
+    let filled = 0;
 
-    let hashed = 0;
+    const flush = async () => {
+        checksum.update(buffer.subarray(0, filled));
+        filled = 0;
 
-    for (const [offset, length] of rows) {
-        for (let start = 0; start < length; start += CHECKSUM_CHUNK_SIZE) {
-            if (hashed >= CHECKSUM_CHUNK_SIZE) {
-                hashed = 0;
+        await new Promise(resolve => {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                resolve();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
 
-                await new Promise(resolve => {
-                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                        resolve();
-                        return GLib.SOURCE_REMOVE;
-                    });
-                });
+        cancellable?.set_error_if_cancelled();
+    };
 
-                cancellable?.set_error_if_cancelled();
+    for (let y = 0; y < height; y++) {
+        let offset = y * rowstride;
+        let remaining = rowLength;
+
+        while (remaining > 0) {
+            const length = Math.min(remaining, buffer.length - filled);
+
+            // Copying short rows byte by byte avoids creating many views
+            if (length < 64) {
+                for (let i = 0; i < length; i++)
+                    buffer[filled + i] = pixels[offset + i];
+            } else {
+                buffer.set(pixels.subarray(offset, offset + length), filled);
             }
 
-            const chunk = Math.min(CHECKSUM_CHUNK_SIZE, length - start);
-            checksum.update(GLib.Bytes.new_from_bytes(pixels, offset + start,
-                chunk).toArray());
-            hashed += chunk;
+            filled += length;
+            offset += length;
+            remaining -= length;
+
+            if (filled === buffer.length)
+                await flush();
         }
     }
+
+    checksum.update(buffer.subarray(0, filled));
 
     return `${width}x${height}x${channels}:${checksum.get_string()}`;
 }

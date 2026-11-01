@@ -102,6 +102,11 @@ const Clipboard = GObject.registerClass({
         // the clipboard owner changes
         this._setSerial = 0;
 
+        // Changes of the GtkClipboard owner caused by setting the content,
+        // which are yet to be reported, and a serial for those that weren't
+        this._ownSets = 0;
+        this._externalSerial = 0;
+
         // Whether a superseded update would have emitted `content-changed`
         this._emitPending = false;
 
@@ -159,8 +164,10 @@ const Clipboard = GObject.registerClass({
 
         this._setSerial++;
 
-        if (this._clipboard instanceof Gtk.Clipboard)
+        if (this._clipboard instanceof Gtk.Clipboard) {
+            this._ownSets++;
             this._clipboard.set_text(content, -1);
+        }
 
         if (this._clipboard instanceof Gio.DBusProxy) {
             this._clipboard.call('SetText', new GLib.Variant('(s)', [content]),
@@ -242,10 +249,21 @@ const Clipboard = GObject.registerClass({
         const display = Gdk.Display.get_default();
         this._clipboard = Gtk.Clipboard.get_default(display);
 
+        this._ownSets = 0;
         this._ownerChangeId = this._clipboard.connect('owner-change',
-            this._onOwnerChange.bind(this));
+            this._onGtkOwnerChange.bind(this));
 
         this._onOwnerChange();
+    }
+
+    _onGtkOwnerChange() {
+        // Each time the content is set, the owner changes once
+        if (this._ownSets > 0)
+            this._ownSets--;
+        else
+            this._externalSerial++;
+
+        return this._onOwnerChange();
     }
 
     _onOwnerChange() {
@@ -392,23 +410,30 @@ const Clipboard = GObject.registerClass({
      * @param {GLib.Bytes} bytes - PNG data
      * @param {string} [checksum] - The checksum of the image, if known (see
      *   {@link getImageChecksum})
+     * @param {Gio.Cancellable} [cancellable] - Cancelled if the image is
+     *   superseded before it is set
      * @returns {Promise<boolean>} %true if the image was set, or %false if the
-     *   clipboard changed before it could be
+     *   clipboard changed or it was cancelled before it could be
      */
-    async setImage(bytes, checksum = null) {
+    async setImage(bytes, checksum = null, cancellable = null) {
         const setSerial = ++this._setSerial;
         this._setImage = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const clipboard = this._clipboard;
-            const serial = this._serial;
-            const pixbuf = await decodeImage(bytes, this._cancellable);
+            const externalSerial = this._externalSerial;
+            const pixbuf = await decodeImage(bytes,
+                cancellable ?? this._cancellable);
 
-            // Don't replace content copied or set while decoding
-            if (this._clipboard !== clipboard || serial !== this._serial ||
-                setSerial !== this._setSerial)
+            // Don't replace content copied elsewhere or set while decoding
+            if (this._clipboard !== clipboard ||
+                externalSerial !== this._externalSerial ||
+                setSerial !== this._setSerial ||
+                cancellable?.is_cancelled() ||
+                this._cancellable.is_cancelled())
                 return false;
 
+            this._ownSets++;
             clipboard.set_image(pixbuf);
             return true;
         } else if (this._clipboard instanceof Gio.DBusProxy) {
@@ -441,6 +466,7 @@ const Clipboard = GObject.registerClass({
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const path = Gio.File.new_for_uri(uri).get_path();
+            this._ownSets++;
             this._clipboard.set_text(path, -1);
 
             return {type: 'text', text: path};

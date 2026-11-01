@@ -190,8 +190,10 @@ const ClipboardPlugin = GObject.registerClass({
         this._outgoingTransfer = null;
         this._incomingTransfer = null;
 
-        // Cancels receiving, loading and converting a file from the device
+        // Cancels receiving, loading and converting a file from the device,
+        // and applying a received image
         this._incomingCancellable = null;
+        this._applyCancellable = null;
 
         // Directories of files being received, which must not be cleaned up
         this._receivingDirs = new Set();
@@ -546,7 +548,13 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Supersede any content still being received or applied from the
         // device, unless this is that content being applied
-        const applied = this._getAppliedContent(content);
+        let applied = this._getAppliedContent(content);
+
+        // An image applied from the device may also be reported again, for
+        // example by a clipboard manager
+        if (applied === null && content.type === 'image' &&
+            this._pulledContent?.type === 'image')
+            applied = this._pulledContent;
 
         if (applied === null)
             this._supersedeRemoteContent(content);
@@ -588,9 +596,15 @@ const ClipboardPlugin = GObject.registerClass({
         try {
             const image = await this._clipboard.getImage();
 
-            if (serial === this._localSerial && image !== null &&
-                image.checksum !== applied.checksum)
-                this._supersedeRemoteContent({type: 'image'});
+            if (serial !== this._localSerial || image === null ||
+                image.checksum === applied.checksum)
+                return;
+
+            this._supersedeRemoteContent({type: 'image'});
+
+            // Pushing was superseded along with the remote content
+            if (this.settings.get_boolean('send-content'))
+                this.clipboardPush();
         } catch (e) {
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
@@ -739,6 +753,11 @@ const ClipboardPlugin = GObject.registerClass({
         if (this._incomingCancellable !== null) {
             this._incomingCancellable.cancel();
             this._incomingCancellable = null;
+        }
+
+        if (this._applyCancellable !== null) {
+            this._applyCancellable.cancel();
+            this._applyCancellable = null;
         }
     }
 
@@ -966,6 +985,11 @@ const ClipboardPlugin = GObject.registerClass({
     async _applyImage(content) {
         const serial = this._remoteSerial;
 
+        // Cancelled if superseded on either side
+        this._applyCancellable?.cancel();
+        const cancellable = new Gio.Cancellable();
+        this._applyCancellable = cancellable;
+
         try {
             // Don't replace a local image with the same image, which may have
             // come back through another device
@@ -982,7 +1006,7 @@ const ClipboardPlugin = GObject.registerClass({
 
             this._expectEcho(content);
             const applied = await this._clipboard.setImage(bytes,
-                content.checksum);
+                content.checksum, cancellable);
 
             if (!applied)
                 this._unexpectEcho(content);
@@ -991,6 +1015,9 @@ const ClipboardPlugin = GObject.registerClass({
 
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
+        } finally {
+            if (this._applyCancellable === cancellable)
+                this._applyCancellable = null;
         }
     }
 

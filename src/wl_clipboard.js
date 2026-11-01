@@ -206,7 +206,8 @@ export const Clipboard = GObject.registerClass(
                 });
             }
 
-            this._wlCopy(new TextEncoder().encode(text));
+            this._wlCopy(new TextEncoder().encode(text),
+                'text/plain;charset=utf-8');
         }
 
         /**

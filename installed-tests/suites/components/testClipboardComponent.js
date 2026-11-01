@@ -230,15 +230,47 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(image.checksum).toBe('known-checksum');
     });
 
-    it('doesn\'t set an image if the clipboard changes while decoding', async function () {
+    it('doesn\'t set an image if copied elsewhere while decoding', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        clipboard._ownSets = 0;
+        spyOn(clipboard._clipboard, 'set_image');
+
+        // Another application takes the clipboard
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]));
+        clipboard._onGtkOwnerChange();
+
+        expect(await result).toBeFalse();
+        expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
+    });
+
+    it('sets an image if only its own change is reported while decoding', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        clipboard._ownSets = 0;
+        spyOn(clipboard._clipboard, 'set_text');
+        spyOn(clipboard._clipboard, 'set_image');
+
+        // Text set before the image is reported while it is decoding
+        clipboard.text = 'set before the image';
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]));
+        clipboard._onGtkOwnerChange();
+
+        expect(await result).toBeTrue();
+        expect(clipboard._clipboard.set_image).toHaveBeenCalled();
+    });
+
+    it('doesn\'t set an image that was cancelled while decoding', async function () {
         const display = Gdk.Display.get_default();
         clipboard._clipboard = Gtk.Clipboard.get_default(display);
         spyOn(clipboard._clipboard, 'set_image');
 
-        const result = clipboard.setImage(new GLib.Bytes(PNG[1]));
-        clipboard._serial++;
+        const cancellable = new Gio.Cancellable();
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]), null,
+            cancellable);
+        cancellable.cancel();
 
-        expect(await result).toBeFalse();
+        await expectAsync(result).toBeRejected();
         expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
     });
 

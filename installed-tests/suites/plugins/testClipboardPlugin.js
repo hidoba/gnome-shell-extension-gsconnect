@@ -855,6 +855,102 @@ describe('The clipboard plugin', function () {
         expect(transfer.cancel).toHaveBeenCalled();
     });
 
+    it('pushes a copied image mistaken for an applied one', async function () {
+        remotePlugin.settings.set_boolean('send-content', true);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+        spyOn(remotePlugin, '_sendImage').and.resolveTo();
+
+        try {
+            // An applied image is expected, but a different image is copied
+            remotePlugin._expectEcho({type: 'image', checksum: 'applied'});
+            const image = tempFile('copied.png', path => {
+                const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                    false, 8, 8, 8);
+                pixbuf.fill(0x0f0f0fff);
+                pixbuf.savev(path, 'png', [], []);
+            });
+            const [, contents] = image.load_contents(null);
+            await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+            await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+            expect(remotePlugin._sendImage).toHaveBeenCalled();
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('keeps a received image reported again by the clipboard', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+        const local = await remotePlugin._clipboard.getImage();
+
+        // The image was applied from the device, and its echo seen
+        const pulled = {
+            type: 'image',
+            checksum: local.checksum,
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = pulled;
+        remotePlugin._pendingEchoes = [];
+
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+
+        const received = remotePlugin._handleFile(filePacket('newer.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        // A clipboard manager takes over the clipboard with the same image
+        remotePlugin._clipboard._setContent({type: 'image', mimetype: 'image/png'},
+            local);
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+
+        expect(transfer.cancel).not.toHaveBeenCalled();
+        expect(remotePlugin._pulledContent).toBe(pulled);
+
+        remotePlugin._cancelIncomingTransfer();
+        await received;
+    });
+
+    it('cancels applying an image superseded by the device', async function () {
+        const content = {
+            type: 'image',
+            checksum: 'cancelled',
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = content;
+
+        let cancellable = null;
+        spyOn(remotePlugin._clipboard, 'setImage').and.callFake((...args) => {
+            cancellable = args[2];
+            return new Promise(() => {});
+        });
+
+        remotePlugin._applyImage(content);
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'newer than the image'},
+        }));
+
+        expect(cancellable.is_cancelled()).toBeTrue();
+    });
+
+    it('hashes tall, narrow images quickly', async function () {
+        const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, false, 8,
+            1, 2000000);
+        pixbuf.fill(0x445566ff);
+
+        const start = Date.now();
+        await getImageChecksum(pixbuf);
+
+        // Hashing row by row took several seconds
+        expect(Date.now() - start).toBeLessThan(1500);
+    });
+
     it('rejects files that are too large', async function () {
         spyOn(remotePlugin.device, 'createTransfer');
         spyOn(remotePlugin.device, 'rejectTransfer');
