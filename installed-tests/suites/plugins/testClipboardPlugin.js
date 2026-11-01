@@ -10,7 +10,7 @@ import * as Utils from '../fixtures/utils.js';
 
 import Config from '../config.js';
 const Core = await import(`file://${Config.PACKAGE_DATADIR}/service/core.js`);
-const {decodeImage, getImageChecksum} = await import(
+const {MAX_FILE_SIZE, decodeImage, getImageChecksum} = await import(
     `file://${Config.PACKAGE_DATADIR}/service/utils/image.js`);
 
 
@@ -106,6 +106,75 @@ function tempFile(name, write) {
     write(path);
 
     return Gio.File.new_for_path(path);
+}
+
+
+/**
+ * Create a mock transfer, which writes a file larger than allowed to the
+ * download target, regardless of the size declared in the packet.
+ *
+ * @param {boolean} pending - Whether the transfer continues until cancelled
+ * @returns {object} A mock transfer
+ */
+function oversizedTransfer(pending) {
+    return {
+        addFile(packet, file) {
+            this.file = file;
+        },
+        start(cancellable) {
+            const stream = this.file.replace(null, false,
+                Gio.FileCreateFlags.NONE, null);
+            stream.seek(MAX_FILE_SIZE, GLib.SeekType.SET, null);
+            stream.write_bytes(new GLib.Bytes([0]), null);
+            stream.close(null);
+
+            if (!pending)
+                return Promise.resolve();
+
+            return new Promise((resolve, reject) => {
+                this.cancel = () => {
+                    this.cancelled = true;
+                    reject(new Gio.IOErrorEnum({
+                        code: Gio.IOErrorEnum.CANCELLED,
+                        message: 'Cancelled',
+                    }));
+                };
+
+                cancellable.connect(() => this.cancel());
+            });
+        },
+        cancel() {},
+    };
+}
+
+
+/**
+ * Watch for content sent to the device, without sending images and files.
+ *
+ * @param {object} plugin - A clipboard plugin
+ */
+function watchPushes(plugin) {
+    spyOn(plugin, 'clipboardPush').and.callThrough();
+    spyOn(plugin, '_sendImage').and.resolveTo();
+    spyOn(plugin, '_sendFile').and.resolveTo();
+    spyOn(plugin.device, 'sendPacket').and.callThrough();
+}
+
+
+/**
+ * Check that the clipboard content was not sent to the device, once it was
+ * pushed.
+ *
+ * @param {object} plugin - A clipboard plugin watched with watchPushes()
+ */
+async function expectNotSentBack(plugin) {
+    await Utils.waitFor(() => plugin.clipboardPush.calls.count() > 0);
+    await Promise.all(plugin.clipboardPush.calls.all()
+        .map(call => call.returnValue));
+
+    expect(plugin._sendImage).not.toHaveBeenCalled();
+    expect(plugin._sendFile).not.toHaveBeenCalled();
+    expect(plugin.device.sendPacket).not.toHaveBeenCalled();
 }
 
 
@@ -422,45 +491,53 @@ describe('The clipboard plugin', function () {
             mockTransfer(Utils.getDataFile('album.png')));
         spyOn(remotePlugin._clipboard, 'setImage').and.callThrough();
         spyOn(remotePlugin, '_applyImage').and.callThrough();
-        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
 
-        await remotePlugin._handleFile(filePacket('album.png'));
-        await remotePlugin._applyImage.calls.mostRecent().returnValue;
+        try {
+            await remotePlugin._handleFile(filePacket('album.png'));
+            await remotePlugin._applyImage.calls.mostRecent().returnValue;
 
-        expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
-        await remotePlugin._clipboard.setImage.calls.mostRecent().returnValue;
-        expect(remotePlugin._clipboard.content.type).toBe('image');
+            expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
+            await remotePlugin._clipboard.setImage.calls.mostRecent().returnValue;
+            expect(remotePlugin._clipboard.content.type).toBe('image');
 
-        // The received image must not be sent back
-        await Promise.idle(GLib.PRIORITY_DEFAULT);
-        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+            // The received image must not be sent back
+            await expectNotSentBack(remotePlugin);
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
     });
 
     it('receives other files into the clipboard as files', async function () {
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
             mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
         spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
-        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
 
-        await remotePlugin._handleFile(filePacket('../../contact.vcf'));
+        try {
+            await remotePlugin._handleFile(filePacket('../../contact.vcf'));
 
-        // The file is saved in the receive directory, with a safe name
-        const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
-        const file = Gio.File.new_for_uri(uri);
-        const dir = remotePlugin._getReceiveDirectory();
-        expect(file.get_basename()).toBe('contact.vcf');
-        expect(file.get_parent().get_parent().equal(dir)).toBeTrue();
-        expect(file.query_exists(null)).toBeTrue();
+            // The file is saved in the receive directory, with a safe name
+            const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
+            const file = Gio.File.new_for_uri(uri);
+            const dir = remotePlugin._getReceiveDirectory();
+            expect(file.get_basename()).toBe('contact.vcf');
+            expect(file.get_parent().get_parent().equal(dir)).toBeTrue();
+            expect(file.query_exists(null)).toBeTrue();
 
-        // Previously received files are removed
-        const iter = dir.enumerate_children('standard::name',
-            Gio.FileQueryInfoFlags.NONE, null);
-        expect(iter.next_file(null)).not.toBeNull();
-        expect(iter.next_file(null)).toBeNull();
+            // Previously received files are removed
+            const iter = dir.enumerate_children('standard::name',
+                Gio.FileQueryInfoFlags.NONE, null);
+            expect(iter.next_file(null)).not.toBeNull();
+            expect(iter.next_file(null)).toBeNull();
 
-        // The received file must not be sent back
-        await Promise.idle(GLib.PRIORITY_DEFAULT);
-        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+            // The received file must not be sent back
+            await expectNotSentBack(remotePlugin);
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
     });
 
     it('cancels receiving a file superseded by text', async function () {
@@ -733,19 +810,25 @@ describe('The clipboard plugin', function () {
     it('keeps a received file reported again by the clipboard', async function () {
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
             mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
-        spyOn(remotePlugin.device, 'sendPacket').and.callThrough();
-
         await remotePlugin._handleFile(filePacket('reported.vcf'));
         const dir = remotePlugin._currentDir;
         const content = remotePlugin._clipboard.content;
 
-        // A clipboard manager takes over the clipboard with the same content
-        remotePlugin._clipboard._setContent({...content});
-        await remotePlugin.clearCache();
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
 
-        expect(remotePlugin._currentDir).toBe(dir);
-        expect(dir.query_exists(null)).toBeTrue();
-        expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+        try {
+            // A clipboard manager takes over the clipboard with the same
+            // content
+            remotePlugin._clipboard._setContent({...content});
+            await remotePlugin.clearCache();
+
+            expect(remotePlugin._currentDir).toBe(dir);
+            expect(dir.query_exists(null)).toBeTrue();
+            await expectNotSentBack(remotePlugin);
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
     });
 
     it('recognizes contents applied in quick succession', async function () {
@@ -1000,16 +1083,19 @@ describe('The clipboard plugin', function () {
         expect(cancellable.is_cancelled()).toBeTrue();
     });
 
-    it('hashes tall, narrow images quickly', async function () {
+    it('hashes tall, narrow images in a few chunks', async function () {
         const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, false, 8,
             1, 2000000);
         pixbuf.fill(0x445566ff);
+        spyOn(GLib.Bytes, 'new_from_bytes').and.callThrough();
+        spyOn(GLib, 'compute_checksum_for_data').and.callThrough();
 
-        const start = Date.now();
         await getImageChecksum(pixbuf);
 
-        // Hashing row by row took several seconds
-        expect(Date.now() - start).toBeLessThan(1500);
+        // Hashing row by row took several seconds, with rows read and hashed
+        // one at a time
+        expect(GLib.Bytes.new_from_bytes.calls.count()).toBeLessThan(10);
+        expect(GLib.compute_checksum_for_data.calls.count()).toBeLessThan(10);
     });
 
     it('rejects files that are too large', async function () {
@@ -1206,6 +1292,50 @@ describe('The clipboard plugin', function () {
 
         const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
         expect(Gio.File.new_for_uri(uri).get_basename()).toBe('two_lines_.vcf');
+    });
+
+    it('keeps the extension of a received file displayed', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('photo\u202egpj.vcf'));
+
+        const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
+        expect(Gio.File.new_for_uri(uri).get_basename()).toBe('photo_gpj.vcf');
+    });
+
+    it('stops receiving a file larger than allowed', async function () {
+        const transfer = oversizedTransfer(true);
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin._clipboard, 'setFile');
+        spyOn(remotePlugin._clipboard, 'setImage');
+        const dir = remotePlugin._currentDir;
+
+        const received = remotePlugin._handleFile(
+            filePacket('declared-small.bin'));
+        await Utils.waitFor(() => transfer.cancelled);
+        await received;
+
+        expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
+        expect(remotePlugin._currentDir).toBe(dir);
+        expect(transfer.file.query_exists(null)).toBeFalse();
+    });
+
+    it('rejects a received file larger than allowed', async function () {
+        const transfer = oversizedTransfer(false);
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin._clipboard, 'setFile');
+        spyOn(remotePlugin._clipboard, 'setImage');
+        const dir = remotePlugin._currentDir;
+
+        await remotePlugin._handleFile(filePacket('declared-small.bin'));
+
+        expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
+        expect(remotePlugin._currentDir).toBe(dir);
+        expect(transfer.file.query_exists(null)).toBeFalse();
     });
 
     it('pushes a copied file again once it changed', async function () {

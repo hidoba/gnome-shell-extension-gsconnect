@@ -99,6 +99,29 @@ const MAX_BASENAME = 200;
 
 
 /**
+ * The interval in milliseconds at which the size of a file being received is
+ * checked.
+ */
+const SIZE_CHECK_INTERVAL = 100;
+
+
+/**
+ * Get the size of a file.
+ *
+ * @param {Gio.File} file - A file
+ * @returns {number} The size in bytes, or 0 if it can't be read
+ */
+function getFileSize(file) {
+    try {
+        return file.query_info(Gio.FILE_ATTRIBUTE_STANDARD_SIZE,
+            Gio.FileQueryInfoFlags.NONE, null).get_size();
+    } catch {
+        return 0;
+    }
+}
+
+
+/**
  * Get a safe local name for a file received from a device.
  *
  * @param {string} filename - The untrusted name chosen by the device
@@ -106,9 +129,10 @@ const MAX_BASENAME = 200;
  */
 function getSafeBasename(filename) {
     // Collapse to a basename, so it can't escape the receive directory, and
-    // replace control characters, so its path is a single line of text
+    // replace control characters, so its path is a single line of text, and
+    // bidirectional controls, so its extension is displayed as it is
     const basename = GLib.path_get_basename(filename)
-        .replace(/\p{Cc}/gu, '_');
+        .replace(/[\p{Cc}\p{Bidi_Control}]/gu, '_');
 
     if (!basename || basename === '.' || basename === '..' ||
         basename.includes('/'))
@@ -445,12 +469,30 @@ const ClipboardPlugin = GObject.registerClass({
             this._incomingTransfer = transfer;
             started = true;
 
+            // Devices may send more than the size they declared, so the file
+            // is checked while it is received and once it is complete
+            const sizeCheckId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+                SIZE_CHECK_INTERVAL, () => {
+                    if (getFileSize(file) > MAX_FILE_SIZE) {
+                        debug('Clipboard file exceeded its size while received',
+                            this.device.name);
+                        cancellable.cancel();
+                    }
+
+                    return GLib.SOURCE_CONTINUE;
+                });
+
             try {
                 await transfer.start(cancellable);
             } finally {
+                GLib.Source.remove(sizeCheckId);
+
                 if (this._incomingTransfer === transfer)
                     this._incomingTransfer = null;
             }
+
+            if (getFileSize(file) > MAX_FILE_SIZE)
+                throw new Error('Clipboard file exceeded its size');
 
             const content = await this._loadFile(file, cancellable);
 
