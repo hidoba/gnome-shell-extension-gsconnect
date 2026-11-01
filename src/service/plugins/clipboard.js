@@ -548,13 +548,7 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Supersede any content still being received or applied from the
         // device, unless this is that content being applied
-        let applied = this._getAppliedContent(content);
-
-        // An image applied from the device may also be reported again, for
-        // example by a clipboard manager
-        if (applied === null && content.type === 'image' &&
-            this._pulledContent?.type === 'image')
-            applied = this._pulledContent;
+        const applied = this._getAppliedContent(content);
 
         if (applied === null)
             this._supersedeRemoteContent(content);
@@ -591,13 +585,15 @@ const ClipboardPlugin = GObject.registerClass({
      * @param {object} applied - The image applied from the device
      */
     async _checkAppliedImage(applied) {
-        const serial = this._localSerial;
+        const localSerial = this._localSerial;
+        const remoteSerial = this._remoteSerial;
 
         try {
             const image = await this._clipboard.getImage();
 
-            if (serial !== this._localSerial || image === null ||
-                image.checksum === applied.checksum)
+            // Newer content from either side takes precedence
+            if (this._isSuperseded(localSerial, remoteSerial) ||
+                image === null || image.checksum === applied.checksum)
                 return;
 
             this._supersedeRemoteContent({type: 'image'});
@@ -997,7 +993,7 @@ const ClipboardPlugin = GObject.registerClass({
                 return;
 
             const bytes = await loadBytes(Gio.File.new_for_uri(content.uri),
-                this.cancellable);
+                cancellable);
 
             // Ignore the image if the clipboard changed on either side in the
             // meantime

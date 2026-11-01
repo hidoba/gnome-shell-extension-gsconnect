@@ -874,41 +874,33 @@ describe('The clipboard plugin', function () {
             await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
             await Promise.idle(GLib.PRIORITY_DEFAULT);
 
-            expect(remotePlugin._sendImage).toHaveBeenCalled();
+            expect(remotePlugin._sendImage).toHaveBeenCalledTimes(1);
         } finally {
             remotePlugin.settings.set_boolean('send-content', false);
         }
     });
 
-    it('keeps a received image reported again by the clipboard', async function () {
+    it('lets newer content from the device win over checking an image', async function () {
         const [, contents] = GLib.file_get_contents(
             Utils.getDataPath('album.png'));
-        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
-        const local = await remotePlugin._clipboard.getImage();
-
-        // The image was applied from the device, and its echo seen
-        const pulled = {
-            type: 'image',
-            checksum: local.checksum,
-            uri: Utils.getDataUri('album.png'),
-        };
-        remotePlugin._pulledContent = pulled;
-        remotePlugin._pendingEchoes = [];
-
         const transfer = pendingTransfer();
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        const getImage = remotePlugin._clipboard.getImage.bind(
+            remotePlugin._clipboard);
+        let received = null;
+
+        // The device starts sending a file while the copied image is read
+        spyOn(remotePlugin._clipboard, 'getImage').and.callFake(() => {
+            received ??= remotePlugin._handleFile(filePacket('newer.bin'));
+            return getImage();
+        });
         spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
 
-        const received = remotePlugin._handleFile(filePacket('newer.bin'));
-        await Promise.idle(GLib.PRIORITY_DEFAULT);
-
-        // A clipboard manager takes over the clipboard with the same image
-        remotePlugin._clipboard._setContent({type: 'image', mimetype: 'image/png'},
-            local);
+        remotePlugin._expectEcho({type: 'image', checksum: 'applied'});
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
         await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
 
         expect(transfer.cancel).not.toHaveBeenCalled();
-        expect(remotePlugin._pulledContent).toBe(pulled);
 
         remotePlugin._cancelIncomingTransfer();
         await received;
