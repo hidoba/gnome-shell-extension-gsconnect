@@ -427,8 +427,11 @@ const ClipboardPlugin = GObject.registerClass({
             // Each file gets its own directory, so a superseded transfer can
             // be removed without affecting a newer file of the same name
             const receiveDir = this._getReceiveDirectory();
-            dir = receiveDir.get_child(`${Date.now()}-${serial}`);
-            dir.make_directory(null);
+            const newDir = receiveDir.get_child(`${Date.now()}-${serial}`);
+            newDir.make_directory(null);
+
+            // The directory is only removed on failure once it was created
+            dir = newDir;
             this._receivingDirs.add(dir.get_path());
 
             const file = dir.get_child(basename);
@@ -833,7 +836,9 @@ const ClipboardPlugin = GObject.registerClass({
                 this._isSuperseded(localSerial, remoteSerial))
                 return;
 
-            if (isSameContent(content, this._remoteContent))
+            // Files sent before are checked for changes when sent again
+            if (content.type !== 'file' &&
+                isSameContent(content, this._remoteContent))
                 return;
 
             // Don't send back content applied from the device
@@ -937,6 +942,8 @@ const ClipboardPlugin = GObject.registerClass({
             [
                 Gio.FILE_ATTRIBUTE_STANDARD_TYPE,
                 Gio.FILE_ATTRIBUTE_STANDARD_SIZE,
+                Gio.FILE_ATTRIBUTE_TIME_MODIFIED,
+                Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC,
             ].join(','),
             Gio.FileQueryInfoFlags.NONE,
             GLib.PRIORITY_DEFAULT,
@@ -957,6 +964,18 @@ const ClipboardPlugin = GObject.registerClass({
         if (this._isSuperseded(localSerial, remoteSerial))
             return;
 
+        // A file is only sent again if it changed since it was last sent
+        const version = [
+            info.get_size(),
+            info.get_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_MODIFIED),
+            info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC),
+        ].join(':');
+
+        if (isSameContent(content, this._remoteContent) &&
+            this._remoteContent.version === version)
+            return;
+
+        content = {...content, version};
         this._remoteContent = content;
 
         const transfer = this.device.createTransfer();

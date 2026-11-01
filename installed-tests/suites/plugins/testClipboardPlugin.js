@@ -1194,6 +1194,57 @@ describe('The clipboard plugin', function () {
         expect(Gio.File.new_for_uri(uri).get_basename()).toBe('two_lines_.vcf');
     });
 
+    it('pushes a copied file again once it changed', async function () {
+        const file = Gio.File.new_for_path(
+            GLib.build_filenamev([Config.CONFIGDIR, 'changing.txt']));
+        file.replace_contents('first', null, false,
+            Gio.FileCreateFlags.NONE, null);
+
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+        spyOn(localPlugin.device, 'createTransfer').and.callFake(() => ({
+            addFile() {},
+            start: () => Promise.resolve(),
+        }));
+
+        const copy = async () => {
+            localPlugin._clipboard.setFile(file.get_uri());
+            await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+        };
+
+        localPlugin.settings.set_boolean('send-content', true);
+
+        try {
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(1);
+
+            // The same file is not sent again while unchanged
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(1);
+
+            file.replace_contents('second version', null, false,
+                Gio.FileCreateFlags.NONE, null);
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(2);
+        } finally {
+            localPlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('keeps an existing directory it failed to create', async function () {
+        const now = Date.now();
+        spyOn(Date, 'now').and.returnValue(now);
+
+        const existing = remotePlugin._getReceiveDirectory().get_child(
+            `${now}-${remotePlugin._remoteSerial + 1}`);
+        existing.make_directory(null);
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket('existing.vcf'));
+
+        expect(existing.query_exists(null)).toBeTrue();
+        Utils.removeDirectory(existing);
+    });
+
     it('checks the format of a received image before decoding it', async function () {
         const cancellable = new Gio.Cancellable();
         spyOn(GdkPixbuf.Pixbuf, 'new_from_stream_async').and.callThrough();
