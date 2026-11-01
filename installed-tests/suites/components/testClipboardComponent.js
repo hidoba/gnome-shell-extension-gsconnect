@@ -125,7 +125,7 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         // Let the component settle on a clipboard, then stop watching it so
         // only the calls made by each test are recorded
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await Utils.waitFor(() => clipboard._ownerChangeId > 0);
         clipboard._disconnectClipboard();
     });
 

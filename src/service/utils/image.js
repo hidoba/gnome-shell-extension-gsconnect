@@ -19,7 +19,7 @@ export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 /**
  * The maximum number of pixels of a received image, to limit memory use.
  */
-export const MAX_IMAGE_PIXELS = 25 * 1000 * 1000;
+const MAX_IMAGE_PIXELS = 25 * 1000 * 1000;
 
 
 /**
@@ -111,7 +111,7 @@ export function loadBytes(file, cancellable = null) {
  * @returns {Promise<Array>} The format (or %null if unsupported), the width
  *   and the height of the image
  */
-export function getImageInfo(file, cancellable = null) {
+function getImageInfo(file, cancellable = null) {
     return new Promise((resolve, reject) => {
         GdkPixbuf.Pixbuf.get_file_info_async(file.get_path(), cancellable,
             (_source, res) => {

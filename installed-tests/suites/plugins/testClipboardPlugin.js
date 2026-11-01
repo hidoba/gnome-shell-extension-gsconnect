@@ -772,11 +772,9 @@ describe('The clipboard plugin', function () {
             const serial = remotePlugin._remoteSerial;
             expect(remotePlugin._pendingEchoes.length).toBe(2);
 
-            await new Promise(resolve => setTimeout(resolve, 50));
-
             // Neither is mistaken for a local copy
+            await Utils.waitFor(() => remotePlugin._pendingEchoes.length === 0);
             expect(remotePlugin._remoteSerial).toBe(serial);
-            expect(remotePlugin._pendingEchoes).toEqual([]);
         } finally {
             remotePlugin._clipboard.async = false;
         }
@@ -992,7 +990,7 @@ describe('The clipboard plugin', function () {
         });
 
         remotePlugin._applyImage(content);
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await Utils.waitFor(() => cancellable !== null);
 
         remotePlugin.handlePacket(new Core.Packet({
             type: 'kdeconnect.clipboard',
@@ -1418,11 +1416,11 @@ describe('The clipboard plugin', function () {
         const [, contents] = GLib.file_get_contents(
             Utils.getDataPath('album.png'));
         await decodeImage(new GLib.Bytes(contents));
-        await new Promise(resolve => setTimeout(resolve, 50));
 
-        const names = listChildren(Gio.File.new_for_path(Config.RUNTIMEDIR));
-        expect(names.filter(name => name.startsWith('clipboard-image-')))
-            .toEqual([]);
+        // The data is removed in the background
+        const runtimeDir = Gio.File.new_for_path(Config.RUNTIMEDIR);
+        await Utils.waitFor(() => !listChildren(runtimeDir)
+            .some(name => name.startsWith('clipboard-image-')));
     });
 
     it('does not decode images with too many pixels', async function () {

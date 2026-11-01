@@ -432,7 +432,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                 <property name="can_focus">False</property>
                                 <property name="halign">start</property>
                                 <property name="margin_bottom">12</property>
-                                <property name="label" translatable="yes">Share images and files through the clipboard with devices that support it</property>
+                                <property name="label" translatable="yes">Share images and files through the clipboard with devices that support it. Takes effect when devices reconnect.</property>
                                 <property name="wrap">True</property>
                                 <property name="xalign">0</property>
                                 <accessibility>

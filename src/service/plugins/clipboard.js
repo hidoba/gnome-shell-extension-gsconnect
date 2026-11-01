@@ -942,6 +942,7 @@ const ClipboardPlugin = GObject.registerClass({
                 this.device.name);
             return;
         }
+
         const info = await file.query_info_async(
             [
                 Gio.FILE_ATTRIBUTE_STANDARD_TYPE,
