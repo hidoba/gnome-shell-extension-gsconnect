@@ -10,7 +10,7 @@ import * as Utils from '../fixtures/utils.js';
 
 import Config from '../config.js';
 const Core = await import(`file://${Config.PACKAGE_DATADIR}/service/core.js`);
-const {getImageChecksum} = await import(
+const {decodeImage, getImageChecksum} = await import(
     `file://${Config.PACKAGE_DATADIR}/service/utils/image.js`);
 
 
@@ -117,6 +117,47 @@ function filePacket(filename, size = 1024) {
         payloadSize: size,
         payloadTransferInfo: {port: 1739},
     });
+}
+
+
+/**
+ * Create pseudo-random data.
+ *
+ * @param {number} length - The length
+ * @returns {Uint8Array} The data
+ */
+function noise(length) {
+    const data = new Uint8Array(length);
+    let state = 1;
+
+    for (let i = 0; i < length; i++) {
+        state = (state * 1103515245 + 12345) & 0x7fffffff;
+        data[i] = state >> 16;
+    }
+
+    return data;
+}
+
+
+/**
+ * Compute the expected checksum of pixel data without padding, which is the
+ * SHA-256 of the digests of each 4 MiB of it.
+ *
+ * @param {string} dimensions - The dimensions, as `WxHxC`
+ * @param {Uint8Array} data - Pixel data without padding
+ * @returns {string} The checksum
+ */
+function referenceChecksum(dimensions, data) {
+    const chunkSize = 4 * 1024 * 1024;
+    const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
+
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+        checksum.update(new TextEncoder().encode(GLib.compute_checksum_for_data(
+            GLib.ChecksumType.SHA256,
+            data.subarray(offset, offset + chunkSize))));
+    }
+
+    return `${dimensions}:${checksum.get_string()}`;
 }
 
 
@@ -760,21 +801,18 @@ describe('The clipboard plugin', function () {
     });
 
     it('hashes large images in chunks', async function () {
-        const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8,
-            1200, 1000);
-        pixbuf.fill(0x12345678);
+        const data = noise(1200 * 1000 * 4);
+        const pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes(data),
+            GdkPixbuf.Colorspace.RGB, true, 8, 1200, 1000, 1200 * 4);
 
-        const expected = GLib.compute_checksum_for_bytes(
-            GLib.ChecksumType.SHA256, pixbuf.read_pixel_bytes());
-
-        expect(await getImageChecksum(pixbuf)).toBe(`1200x1000x4:${expected}`);
+        expect(await getImageChecksum(pixbuf)).toBe(
+            referenceChecksum('1200x1000x4', data));
     });
 
     it('hashes images without the padding between rows', async function () {
         const pixels = [10, 20, 30, 40, 50, 60, 70, 80, 90, 11, 12, 13, 14, 15,
             16, 17, 18, 19];
-        const expected = GLib.compute_checksum_for_data(
-            GLib.ChecksumType.SHA256, pixels);
+        const expected = referenceChecksum('3x2x3', new Uint8Array(pixels));
 
         // The same pixels, with and without padding
         const padded = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes([
@@ -783,8 +821,25 @@ describe('The clipboard plugin', function () {
         const unpadded = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes(pixels),
             GdkPixbuf.Colorspace.RGB, false, 8, 3, 2, 9);
 
-        expect(await getImageChecksum(padded)).toBe(`3x2x3:${expected}`);
-        expect(await getImageChecksum(unpadded)).toBe(`3x2x3:${expected}`);
+        expect(await getImageChecksum(padded)).toBe(expected);
+        expect(await getImageChecksum(unpadded)).toBe(expected);
+    });
+
+    it('hashes large images with padding between rows', async function () {
+        const [width, height, rowLength, rowstride] = [1001, 2000, 3003, 3004];
+        const data = noise(rowLength * height);
+        const padded = new Uint8Array(rowstride * height);
+
+        for (let y = 0; y < height; y++) {
+            padded.set(data.subarray(y * rowLength, (y + 1) * rowLength),
+                y * rowstride);
+        }
+
+        const pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes(padded),
+            GdkPixbuf.Colorspace.RGB, false, 8, width, height, rowstride);
+
+        expect(await getImageChecksum(pixbuf)).toBe(
+            referenceChecksum(`${width}x${height}x3`, data));
     });
 
     it('cancels receiving a file through its cancellable', async function () {
@@ -963,6 +1018,109 @@ describe('The clipboard plugin', function () {
         expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
         expect(remotePlugin.device.createTransfer).not.toHaveBeenCalled();
         remotePlugin.settings.set_boolean('receive-content', true);
+    });
+
+    it('pushes text copied again after the device sent a file', async function () {
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'copied again'},
+        }));
+
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin.device, 'sendPacket');
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            const received = remotePlugin._handleFile(filePacket('slow.bin'));
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+            // The device has the file, so the text is a new change
+            remotePlugin._clipboard._setContent({type: 'text', text: 'copied again'});
+            await received;
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+            expect(remotePlugin.device.sendPacket).toHaveBeenCalledWith(
+                jasmine.objectContaining({
+                    type: 'kdeconnect.clipboard',
+                    body: {content: 'copied again'},
+                }));
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('applies a file received in full, even if disconnected', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+
+        // The connection is lost while the file is loaded
+        const loadFile = remotePlugin._loadFile.bind(remotePlugin);
+        spyOn(remotePlugin, '_loadFile').and.callFake((...args) => {
+            remotePlugin.disconnected();
+            return loadFile(...args);
+        });
+
+        try {
+            await remotePlugin._handleFile(filePacket('complete.vcf'));
+        } finally {
+            remotePlugin.connected();
+        }
+
+        expect(remotePlugin._clipboard.setFile).toHaveBeenCalled();
+    });
+
+    it('does not push the path of a received file as text', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        localPlugin.settings.set_boolean('send-content', true);
+        remotePlugin._clipboard.filesAsText = true;
+
+        try {
+            // A clipboard that can't hold a file gets its path
+            await remotePlugin._handleFile(filePacket('as-text.vcf'));
+            const {text} = remotePlugin._clipboard.content;
+            expect(text).toMatch(/as-text\.vcf$/);
+
+            // The plugin of another device sees it in the same clipboard
+            localPlugin._clipboard.text = text;
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+            expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+
+            // Nor when connecting
+            localPlugin.connected();
+            expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+        } finally {
+            remotePlugin._clipboard.filesAsText = false;
+            localPlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('recognizes images applied in quick succession reported once', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        const pixbuf = await decodeImage(new GLib.Bytes(contents));
+        const checksum = await getImageChecksum(pixbuf);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+        const serial = remotePlugin._remoteSerial;
+
+        // Only the last of two applied images is reported
+        remotePlugin._expectEcho({type: 'image', checksum: 'first'});
+        remotePlugin._expectEcho({type: 'image', checksum: checksum});
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+
+        expect(remotePlugin._remoteSerial).toBe(serial);
+        expect(remotePlugin._pendingEchoes).toEqual([]);
+    });
+
+    it('does not decode images with too many pixels', async function () {
+        const bytes = new GLib.Bytes(Utils.createHugePng(20000, 20000));
+
+        await expectAsync(decodeImage(bytes)).toBeRejectedWithError(
+            /too large/);
     });
 
     it('disables its GActions when disconnected', function () {

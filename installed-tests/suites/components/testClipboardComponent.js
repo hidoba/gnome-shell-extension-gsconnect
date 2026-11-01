@@ -296,7 +296,47 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(await result).toBeFalse();
         expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
 
-        // The image data is only kept for the clipboard portal
+        // An image that wasn't set isn't recognized as the one in the clipboard
         expect(clipboard._setImage).toBeNull();
+    });
+
+    it('recognizes an image it set without reading it back', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        clipboard._ownSets = 0;
+        spyOn(clipboard._clipboard, 'set_image');
+        spyOn(clipboard._clipboard, 'request_contents');
+
+        expect(await clipboard.setImage(new GLib.Bytes(PNG[1]),
+            'set-checksum')).toBeTrue();
+        clipboard._applyUpdate({type: 'image', mimetype: 'image/png'}, false);
+        const image = await clipboard.getImage();
+
+        expect(image.checksum).toBe('set-checksum');
+        expect(clipboard._clipboard.request_contents).not.toHaveBeenCalled();
+
+        // Until another application takes the clipboard
+        clipboard._ownSets = 0;
+        spyOn(clipboard, '_update');
+        clipboard._onGtkOwnerChange();
+
+        expect(clipboard._setImage).toBeNull();
+    });
+
+    it('doesn\'t decode a copied image with too many pixels', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        clipboard._setImage = null;
+        spyOn(clipboard._clipboard, 'request_contents').and.callFake(
+            (target, callback) => {
+                callback(clipboard._clipboard, {
+                    get_data: () => Utils.createHugePng(20000, 20000),
+                });
+            });
+
+        clipboard._applyUpdate({type: 'image', mimetype: 'image/png'}, false);
+
+        await expectAsync(clipboard.getImage()).toBeRejectedWithError(
+            /too large/);
     });
 });

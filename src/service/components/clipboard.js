@@ -110,7 +110,7 @@ const Clipboard = GObject.registerClass({
         // Whether a superseded update would have emitted `content-changed`
         this._emitPending = false;
 
-        // The last image set, to recognize it without decoding it again
+        // The last image set, to recognize it without reading it again
         this._setImage = null;
 
         // Images and files are only looked for when enabled
@@ -163,6 +163,7 @@ const Clipboard = GObject.registerClass({
         }
 
         this._setSerial++;
+        this._setImage = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             this._ownSets++;
@@ -258,10 +259,12 @@ const Clipboard = GObject.registerClass({
 
     _onGtkOwnerChange() {
         // Each time the content is set, the owner changes once
-        if (this._ownSets > 0)
+        if (this._ownSets > 0) {
             this._ownSets--;
-        else
+        } else {
             this._externalSerial++;
+            this._setImage = null;
+        }
 
         return this._onOwnerChange();
     }
@@ -370,14 +373,25 @@ const Clipboard = GObject.registerClass({
         let pixbuf, bytes = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
-            pixbuf = await new Promise((resolve, reject) => {
-                this._clipboard.request_image((clipboard, image) => {
-                    resolve(image);
+            // Don't read back an image that was just set, which would block
+            // until it is converted to the requested format
+            if (this._setImage !== null)
+                return this._setImage;
+
+            // The data is read and decoded separately, to limit the size of
+            // the image and avoid decoding it in the main thread
+            const data = await new Promise((resolve, reject) => {
+                this._clipboard.request_contents(Gdk.Atom.intern(mimetype,
+                    false), (clipboard, selection) => {
+                    resolve(selection?.get_data() ?? null);
                 });
             });
 
-            if (pixbuf === null)
+            if (data === null || data.length === 0)
                 throw new Error('Clipboard image not available');
+
+            bytes = new GLib.Bytes(data);
+            pixbuf = await decodeImage(bytes, this._cancellable);
         } else if (this._clipboard instanceof Gio.DBusProxy) {
             bytes = await this._proxyGetValue(this._clipboard, mimetype);
 
@@ -395,12 +409,12 @@ const Clipboard = GObject.registerClass({
         }
 
         // Send PNG data as-is, otherwise convert it to PNG
-        if (mimetype !== 'image/png' || bytes === null)
+        if (mimetype !== 'image/png')
             bytes = await encodePng(pixbuf, this._cancellable);
 
         return {
             bytes: bytes,
-            checksum: await getImageChecksum(pixbuf),
+            checksum: await getImageChecksum(pixbuf, this._cancellable),
         };
     }
 
@@ -433,6 +447,10 @@ const Clipboard = GObject.registerClass({
                 this._cancellable.is_cancelled())
                 return false;
 
+            // The image is recognized without reading it back
+            if (checksum !== null)
+                this._setImage = {bytes, checksum};
+
             this._ownSets++;
             clipboard.set_image(pixbuf);
             return true;
@@ -463,6 +481,7 @@ const Clipboard = GObject.registerClass({
      */
     setFile(uri) {
         this._setSerial++;
+        this._setImage = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const path = Gio.File.new_for_uri(uri).get_path();

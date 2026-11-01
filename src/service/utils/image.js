@@ -124,9 +124,52 @@ export function getImageInfo(file, cancellable = null) {
 
 
 /**
+ * Decode an image file into a pixbuf, in a worker thread.
+ *
+ * Images with more pixels than {@link MAX_IMAGE_PIXELS} are rejected without
+ * being decoded.
+ *
+ * @param {Gio.File} file - An image file
+ * @param {Gio.Cancellable} [cancellable] - A cancellable
+ * @returns {Promise<Array>} The GdkPixbuf name of the format and a pixbuf
+ */
+export async function decodeImageFile(file, cancellable = null) {
+    // Check the dimensions before decoding the image
+    const [format, width, height] = await getImageInfo(file, cancellable);
+
+    if (format === null)
+        throw new Error('Unsupported image format');
+
+    if (width * height > MAX_IMAGE_PIXELS)
+        throw new Error(`Image is too large: ${width}x${height}`);
+
+    const stream = await file.read_async(GLib.PRIORITY_DEFAULT, cancellable);
+
+    try {
+        const pixbuf = await new Promise((resolve, reject) => {
+            GdkPixbuf.Pixbuf.new_from_stream_async(stream, cancellable,
+                (_source, res) => {
+                    try {
+                        resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(res));
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+        });
+
+        return [format.get_name(),
+            pixbuf.apply_embedded_orientation() ?? pixbuf];
+    } finally {
+        stream.close(null);
+    }
+}
+
+
+/**
  * Decode image data into a pixbuf, in a worker thread.
  *
- * Data larger than {@link MAX_FILE_SIZE} is rejected without being decoded.
+ * Data larger than {@link MAX_FILE_SIZE}, or images with more pixels than
+ * {@link MAX_IMAGE_PIXELS}, are rejected without being decoded.
  *
  * @param {GLib.Bytes} bytes - Encoded image data
  * @param {Gio.Cancellable} [cancellable] - A cancellable
@@ -136,19 +179,24 @@ export async function decodeImage(bytes, cancellable = null) {
     if (bytes.get_size() > MAX_FILE_SIZE)
         throw new Error('Image is too large');
 
-    const stream = Gio.MemoryInputStream.new_from_bytes(bytes);
-    const pixbuf = await new Promise((resolve, reject) => {
-        GdkPixbuf.Pixbuf.new_from_stream_async(stream, cancellable,
-            (_source, res) => {
-                try {
-                    resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(res));
-                } catch (e) {
-                    reject(e);
-                }
-            });
-    });
+    // The dimensions can only be read without blocking from a file, which is
+    // kept in memory and only readable by the user
+    const file = Gio.File.new_for_path(GLib.build_filenamev([
+        GLib.get_user_runtime_dir(),
+        `gsconnect-image-${GLib.uuid_string_random()}`,
+    ]));
 
-    return pixbuf.apply_embedded_orientation() ?? pixbuf;
+    try {
+        await file.replace_contents_bytes_async(bytes, null, false,
+            Gio.FileCreateFlags.PRIVATE, cancellable);
+
+        const [, pixbuf] = await decodeImageFile(file, cancellable);
+        return pixbuf;
+    } finally {
+        file.delete_async(GLib.PRIORITY_DEFAULT, null).catch(e => {
+            debug(e);
+        });
+    }
 }
 
 
@@ -194,18 +242,14 @@ export async function getImageChecksum(pixbuf, cancellable = null) {
     const {width, height, rowstride} = pixbuf;
     const channels = pixbuf.n_channels;
     const rowLength = width * channels * pixbuf.bits_per_sample / 8;
-    const pixels = pixbuf.read_pixel_bytes().toArray();
+    const size = rowLength * height;
+    const pixels = pixbuf.read_pixel_bytes();
+
+    // The pixel data without the padding between rows is hashed in chunks,
+    // and the checksum is that of their digests
     const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
 
-    // Rows are copied into a buffer without their padding, which is hashed
-    // each time it's full, so the cost doesn't depend on the number of rows
-    const buffer = new Uint8Array(CHECKSUM_CHUNK_SIZE);
-    let filled = 0;
-
-    const flush = async () => {
-        checksum.update(buffer.subarray(0, filled));
-        filled = 0;
-
+    const yieldChunk = async () => {
         await new Promise(resolve => {
             GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
                 resolve();
@@ -216,31 +260,71 @@ export async function getImageChecksum(pixbuf, cancellable = null) {
         cancellable?.set_error_if_cancelled();
     };
 
-    for (let y = 0; y < height; y++) {
-        let offset = y * rowstride;
-        let remaining = rowLength;
+    if (rowstride === rowLength) {
+        // Without padding, the chunks are hashed without copying them
+        for (let offset = 0; offset < size; offset += CHECKSUM_CHUNK_SIZE) {
+            const chunk = GLib.Bytes.new_from_bytes(pixels, offset,
+                Math.min(CHECKSUM_CHUNK_SIZE, size - offset));
+            checksum.update(new TextEncoder().encode(
+                GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256,
+                    chunk)));
 
-        while (remaining > 0) {
-            const length = Math.min(remaining, buffer.length - filled);
+            await yieldChunk();
+        }
+    } else {
+        // Rows are copied into a buffer without their padding, so the cost
+        // doesn't depend on the number of rows
+        const buffer = new Uint8Array(Math.min(CHECKSUM_CHUNK_SIZE, size));
+        const windowRows = Math.max(1,
+            Math.floor(CHECKSUM_CHUNK_SIZE / rowstride));
+        let filled = 0;
 
-            // Copying short rows byte by byte avoids creating many views
-            if (length < 64) {
-                for (let i = 0; i < length; i++)
-                    buffer[filled + i] = pixels[offset + i];
-            } else {
-                buffer.set(pixels.subarray(offset, offset + length), filled);
+        for (let first = 0; first < height; first += windowRows) {
+            const rows = Math.min(windowRows, height - first);
+
+            // The last row of a pixbuf may not be padded
+            const window = GLib.Bytes.new_from_bytes(pixels, first * rowstride,
+                (rows - 1) * rowstride + rowLength).toArray();
+
+            for (let y = 0; y < rows; y++) {
+                let offset = y * rowstride;
+                let remaining = rowLength;
+
+                while (remaining > 0) {
+                    const length = Math.min(remaining, buffer.length - filled);
+
+                    // Copying short rows byte by byte avoids creating many
+                    // views
+                    if (length < 64) {
+                        for (let i = 0; i < length; i++)
+                            buffer[filled + i] = window[offset + i];
+                    } else {
+                        buffer.set(window.subarray(offset, offset + length),
+                            filled);
+                    }
+
+                    filled += length;
+                    offset += length;
+                    remaining -= length;
+
+                    if (filled === buffer.length) {
+                        checksum.update(new TextEncoder().encode(
+                            GLib.compute_checksum_for_data(
+                                GLib.ChecksumType.SHA256, buffer)));
+                        filled = 0;
+
+                        await yieldChunk();
+                    }
+                }
             }
+        }
 
-            filled += length;
-            offset += length;
-            remaining -= length;
-
-            if (filled === buffer.length)
-                await flush();
+        if (filled > 0) {
+            checksum.update(new TextEncoder().encode(
+                GLib.compute_checksum_for_data(GLib.ChecksumType.SHA256,
+                    buffer.subarray(0, filled))));
         }
     }
-
-    checksum.update(buffer.subarray(0, filled));
 
     return `${width}x${height}x${channels}:${checksum.get_string()}`;
 }

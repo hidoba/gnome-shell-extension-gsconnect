@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 
@@ -68,6 +69,20 @@ const Component = GObject.registerClass({
         this._async = async;
     }
 
+    /**
+     * Whether files are placed in the clipboard as their path, like the real
+     * component does with a GtkClipboard.
+     *
+     * @type {boolean}
+     */
+    get filesAsText() {
+        return this._filesAsText ?? false;
+    }
+
+    set filesAsText(filesAsText) {
+        this._filesAsText = filesAsText;
+    }
+
     _setContent(content, image = null) {
         this._content = content;
         this._image = image;
@@ -99,8 +114,11 @@ const Component = GObject.registerClass({
         return Promise.resolve(this._image);
     }
 
-    async setImage(bytes) {
-        const pixbuf = await decodeImage(bytes);
+    async setImage(bytes, checksum = null, cancellable = null) {
+        const pixbuf = await decodeImage(bytes, cancellable);
+
+        if (cancellable?.is_cancelled())
+            return false;
 
         this._setContent({type: 'image', mimetype: 'image/png'}, {
             bytes: await encodePng(pixbuf),
@@ -111,6 +129,11 @@ const Component = GObject.registerClass({
     }
 
     setFile(uri) {
+        if (this.filesAsText) {
+            this.text = Gio.File.new_for_uri(uri).get_path();
+            return this.content;
+        }
+
         const content = {type: 'file', uri: uri};
         this._setContent(content);
 

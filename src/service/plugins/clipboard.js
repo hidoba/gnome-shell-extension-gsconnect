@@ -11,12 +11,10 @@ import * as Components from '../components/index.js';
 import Plugin from '../plugin.js';
 import {
     MAX_FILE_SIZE,
-    MAX_IMAGE_PIXELS,
-    decodeImage,
+    decodeImageFile,
     encodePng,
     getImageChecksum,
     getImageFormat,
-    getImageInfo,
     loadBytes
 } from '../utils/image.js';
 
@@ -153,6 +151,19 @@ function isReceivedFile(file) {
 
 
 /**
+ * Check if text is the path of a file received through the clipboard, which
+ * is how files are placed in a clipboard that can't hold a file list.
+ *
+ * @param {string} text - Clipboard text
+ * @returns {boolean} %true if the text is the path of a received file
+ */
+function isReceivedPath(text) {
+    return GLib.path_is_absolute(text) && !text.includes('\n') &&
+        isReceivedFile(Gio.File.new_for_path(text));
+}
+
+
+/**
  * Clipboard Plugin
  * https://github.com/KDE/kdeconnect-kde/tree/master/plugins/clipboard
  */
@@ -224,7 +235,8 @@ const ClipboardPlugin = GObject.registerClass({
             return;
 
         // Files and images are not sent on connection
-        if (typeof this._localBuffer !== 'string')
+        if (typeof this._localBuffer !== 'string' ||
+            isReceivedPath(this._localBuffer))
             return;
 
         if (this._localBuffer === '' && this._localTimestamp === 0)
@@ -242,8 +254,13 @@ const ClipboardPlugin = GObject.registerClass({
     disconnected() {
         super.disconnected();
 
-        // Pending transfers can't complete without a connection
-        this._cancelIncomingTransfer();
+        // Pending transfers can't complete without a connection, but a file
+        // received in full is still applied
+        if (this._incomingTransfer !== null) {
+            this._incomingTransfer.cancel();
+            this._incomingTransfer = null;
+        }
+
         this._cancelOutgoingTransfer();
     }
 
@@ -398,7 +415,8 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Cancelled when superseded, or when the plugin is destroyed
         const cancellable = new Gio.Cancellable();
-        const cancelledId = this.cancellable.connect(() => cancellable.cancel());
+        const pluginCancellable = this.cancellable;
+        const cancelledId = pluginCancellable.connect(() => cancellable.cancel());
         this._incomingCancellable = cancellable;
 
         try {
@@ -453,7 +471,7 @@ const ClipboardPlugin = GObject.registerClass({
             if (dir !== null)
                 this._receivingDirs.delete(dir.get_path());
 
-            this.cancellable.disconnect(cancelledId);
+            pluginCancellable.disconnect(cancelledId);
 
             if (this._incomingCancellable === cancellable)
                 this._incomingCancellable = null;
@@ -499,18 +517,11 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {Promise<object>} A clipboard content
      */
     async _loadImage(file, format, cancellable) {
-        // Check the dimensions before decoding the image
-        const [info, width, height] = await getImageInfo(file, cancellable);
-
-        if (info?.get_name() !== format)
-            throw new Error(`Unexpected image format: ${info?.get_name()}`);
-
-        if (width * height > MAX_IMAGE_PIXELS)
-            throw new Error(`Image is too large: ${width}x${height}`);
-
-        const pixbuf = await decodeImage(await loadBytes(file, cancellable),
-            cancellable);
+        const [name, pixbuf] = await decodeImageFile(file, cancellable);
         cancellable.set_error_if_cancelled();
+
+        if (name !== format)
+            throw new Error(`Unexpected image format: ${name}`);
 
         let pngFile = file;
 
@@ -571,8 +582,10 @@ const ClipboardPlugin = GObject.registerClass({
         this._pendingEchoes = [];
 
         // Content applied from the device may be reported again, for example
-        // by a clipboard manager, and is still in the clipboard
-        if (!isSameContent(content, this._pulledContent)) {
+        // by a clipboard manager, and is still in the clipboard. Once the
+        // device has changed its clipboard since, it is sent back.
+        if (this._remoteContent === null ||
+            !isSameContent(content, this._pulledContent)) {
             this._pulledContent = null;
             this._currentDir = null;
         }
@@ -592,9 +605,23 @@ const ClipboardPlugin = GObject.registerClass({
             const image = await this._clipboard.getImage();
 
             // Newer content from either side takes precedence
-            if (this._isSuperseded(localSerial, remoteSerial) ||
-                image === null || image.checksum === applied.checksum)
+            if (this._isSuperseded(localSerial, remoteSerial) || image === null)
                 return;
+
+            if (image.checksum === applied.checksum)
+                return;
+
+            // Images applied in quick succession may be reported once, as the
+            // last of them
+            const index = this._pendingEchoes.findIndex(pending => {
+                return pending.type === 'image' &&
+                    pending.checksum === image.checksum;
+            });
+
+            if (index !== -1) {
+                this._pendingEchoes.splice(0, index + 1);
+                return;
+            }
 
             this._supersedeRemoteContent({type: 'image'});
 
@@ -798,6 +825,14 @@ const ClipboardPlugin = GObject.registerClass({
             // Don't send back content applied from the device
             if (isSameContent(content, this._pulledContent))
                 return;
+
+            // Received files placed in the clipboard as their path are not
+            // sent on, like the files themselves
+            if (content.type === 'text' && isReceivedPath(content.text)) {
+                debug('Not forwarding the path of a received file',
+                    this.device.name);
+                return;
+            }
 
             this._pulledContent = null;
 
