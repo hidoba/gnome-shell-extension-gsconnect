@@ -1211,6 +1211,13 @@ describe('The clipboard plugin', function () {
             await localPlugin.clipboardPush.calls.mostRecent().returnValue;
         };
 
+        const edit = (contents, modified) => {
+            file.replace_contents(contents, null, false,
+                Gio.FileCreateFlags.NONE, null);
+            file.set_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_MODIFIED,
+                modified, Gio.FileQueryInfoFlags.NONE, null);
+        };
+
         localPlugin.settings.set_boolean('send-content', true);
 
         try {
@@ -1221,10 +1228,48 @@ describe('The clipboard plugin', function () {
             await copy();
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(1);
 
-            file.replace_contents('second version', null, false,
-                Gio.FileCreateFlags.NONE, null);
+            // An edit is noticed by the modification time, even if the size
+            // is the same
+            edit('third', 1000000000);
             await copy();
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(2);
+
+            // Pulling the clipboard doesn't make it content from the device
+            localPlugin.clipboardPull();
+            edit('other', 1000000001);
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(3);
+        } finally {
+            localPlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('pushes a copied file again without a modification time', async function () {
+        const file = Gio.File.new_for_path(
+            GLib.build_filenamev([Config.CONFIGDIR, 'untimed.txt']));
+        file.replace_contents('first', null, false,
+            Gio.FileCreateFlags.NONE, null);
+
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+        spyOn(localPlugin.device, 'createTransfer').and.callFake(() => ({
+            addFile() {},
+            start: () => Promise.resolve(),
+        }));
+        const hasAttribute = Gio.FileInfo.prototype.has_attribute;
+        spyOn(Gio.FileInfo.prototype, 'has_attribute').and.callFake(
+            function (name) {
+                return name !== Gio.FILE_ATTRIBUTE_TIME_MODIFIED &&
+                    hasAttribute.call(this, name);
+            });
+
+        localPlugin.settings.set_boolean('send-content', true);
+
+        try {
+            for (let i = 1; i <= 2; i++) {
+                localPlugin._clipboard.setFile(file.get_uri());
+                await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+                expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(i);
+            }
         } finally {
             localPlugin.settings.set_boolean('send-content', false);
         }
@@ -1239,8 +1284,13 @@ describe('The clipboard plugin', function () {
         existing.make_directory(null);
         spyOn(remotePlugin.device, 'rejectTransfer');
 
+        remotePlugin._serviceSettings.set_boolean('clipboard-files', true);
+        remotePlugin.settings.set_boolean('receive-content', true);
         await remotePlugin._handleFile(filePacket('existing.vcf'));
 
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+        expect(remotePlugin._receivingDirs.size).toBe(0);
+        expect(remotePlugin._currentDir?.get_path()).not.toBe(existing.get_path());
         expect(existing.query_exists(null)).toBeTrue();
         Utils.removeDirectory(existing);
     });

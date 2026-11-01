@@ -964,14 +964,17 @@ const ClipboardPlugin = GObject.registerClass({
         if (this._isSuperseded(localSerial, remoteSerial))
             return;
 
-        // A file is only sent again if it changed since it was last sent
-        const version = [
-            info.get_size(),
-            info.get_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_MODIFIED),
-            info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC),
-        ].join(':');
+        // A file is only sent again if it changed since it was last sent, or
+        // if that can't be told from its modification time
+        const version = info.has_attribute(Gio.FILE_ATTRIBUTE_TIME_MODIFIED)
+            ? [
+                info.get_size(),
+                info.get_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_MODIFIED),
+                info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC),
+            ].join(':')
+            : null;
 
-        if (isSameContent(content, this._remoteContent) &&
+        if (version !== null && isSameContent(content, this._remoteContent) &&
             this._remoteContent.version === version)
             return;
 
@@ -1027,6 +1030,11 @@ const ClipboardPlugin = GObject.registerClass({
                 break;
 
             case 'file': {
+                // Files sent to the device are local files, which would
+                // otherwise not be sent again once changed
+                if (content.version !== undefined)
+                    break;
+
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
                 this._pulledContent = content;
