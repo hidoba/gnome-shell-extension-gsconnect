@@ -471,21 +471,24 @@ const ClipboardPlugin = GObject.registerClass({
 
             // Devices may send more than the size they declared, so the file
             // is checked while it is received and once it is complete
-            const sizeCheckId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+            let sizeCheckId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
                 SIZE_CHECK_INTERVAL, () => {
-                    if (getFileSize(file) > MAX_FILE_SIZE) {
-                        debug('Clipboard file exceeded its size while received',
-                            this.device.name);
-                        cancellable.cancel();
-                    }
+                    if (getFileSize(file) <= MAX_FILE_SIZE)
+                        return GLib.SOURCE_CONTINUE;
 
-                    return GLib.SOURCE_CONTINUE;
+                    debug('Clipboard file exceeded its size while received',
+                        this.device.name);
+                    sizeCheckId = 0;
+                    cancellable.cancel();
+
+                    return GLib.SOURCE_REMOVE;
                 });
 
             try {
                 await transfer.start(cancellable);
             } finally {
-                GLib.Source.remove(sizeCheckId);
+                if (sizeCheckId !== 0)
+                    GLib.Source.remove(sizeCheckId);
 
                 if (this._incomingTransfer === transfer)
                     this._incomingTransfer = null;
