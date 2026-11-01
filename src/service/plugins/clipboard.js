@@ -392,9 +392,13 @@ const ClipboardPlugin = GObject.registerClass({
     }
 
     async _handleFile(packet) {
-        if (!packet.hasPayload() || typeof packet.body.filename !== 'string') {
-            debug('Ignoring clipboard file without payload or filename',
+        if (!packet.hasPayload())
+            return;
+
+        if (typeof packet.body.filename !== 'string') {
+            debug('Rejecting clipboard file without a filename',
                 this.device.name);
+            this.device.rejectTransfer(packet);
             return;
         }
 

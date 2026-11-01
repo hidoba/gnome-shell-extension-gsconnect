@@ -89,14 +89,20 @@ function listChildren(dir) {
 
 
 /**
- * Write a file in a new temporary directory.
+ * Write a file in a new directory, within the isolated test directories.
  *
  * @param {string} name - The file name
  * @param {function(string)} write - Writes the file at a path
  * @returns {Gio.File} The file
  */
 function tempFile(name, write) {
-    const path = GLib.build_filenamev([GLib.dir_make_tmp(null), name]);
+    const dir = GLib.build_filenamev([
+        Config.CONFIGDIR,
+        GLib.uuid_string_random(),
+    ]);
+    GLib.mkdir_with_parents(dir, 448);
+
+    const path = GLib.build_filenamev([dir, name]);
     write(path);
 
     return Gio.File.new_for_path(path);
@@ -675,6 +681,16 @@ describe('The clipboard plugin', function () {
 
         await remotePlugin._handleFile(filePacket('failed.bin'));
 
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
+    });
+
+    it('rejects a file without a name', async function () {
+        spyOn(remotePlugin.device, 'createTransfer');
+        spyOn(remotePlugin.device, 'rejectTransfer');
+
+        await remotePlugin._handleFile(filePacket(null));
+
+        expect(remotePlugin.device.createTransfer).not.toHaveBeenCalled();
         expect(remotePlugin.device.rejectTransfer).toHaveBeenCalled();
     });
 

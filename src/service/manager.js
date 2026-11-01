@@ -254,11 +254,11 @@ const Manager = GObject.registerClass({
         this.settings.bind('name', this, 'name', 0);
 
         // Settings that enable capabilities, which devices learn about when
-        // they next connect. The key is read first, since changes are only
-        // reported for keys that have been read.
-        this.settings.get_boolean('clipboard-files');
+        // they next connect. The key is read once connected, since changes
+        // are only reported for keys read while a handler is connected.
         this._clipboardFilesChangedId = this.settings.connect(
             'changed::clipboard-files', this._rebuildIdentity.bind(this));
+        this.settings.get_boolean('clipboard-files');
     }
 
     _onDebugChanged(debug = false) {
