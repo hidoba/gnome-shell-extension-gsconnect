@@ -517,11 +517,8 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {Promise<object>} A clipboard content
      */
     async _loadImage(file, format, cancellable) {
-        const [name, pixbuf] = await decodeImageFile(file, cancellable);
+        const pixbuf = await decodeImageFile(file, cancellable, format);
         cancellable.set_error_if_cancelled();
-
-        if (name !== format)
-            throw new Error(`Unexpected image format: ${name}`);
 
         let pngFile = file;
 
@@ -584,10 +581,11 @@ const ClipboardPlugin = GObject.registerClass({
         // Content applied from the device may be reported again, for example
         // by a clipboard manager, and is still in the clipboard. Once the
         // device has changed its clipboard since, it is sent back.
-        if (this._remoteContent === null ||
-            !isSameContent(content, this._pulledContent)) {
+        if (!isSameContent(content, this._pulledContent)) {
             this._pulledContent = null;
             this._currentDir = null;
+        } else if (this._remoteContent === null) {
+            this._pulledContent = null;
         }
     }
 
@@ -618,8 +616,9 @@ const ClipboardPlugin = GObject.registerClass({
                     pending.checksum === image.checksum;
             });
 
+            // That image may still be reported itself, so it stays expected
             if (index !== -1) {
-                this._pendingEchoes.splice(0, index + 1);
+                this._pendingEchoes.splice(0, index);
                 return;
             }
 

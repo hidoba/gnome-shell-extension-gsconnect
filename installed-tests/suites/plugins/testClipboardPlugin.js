@@ -1113,7 +1113,55 @@ describe('The clipboard plugin', function () {
         await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
 
         expect(remotePlugin._remoteSerial).toBe(serial);
+        expect(remotePlugin._pendingEchoes.length).toBe(1);
+
+        // The last image may still be reported itself
+        remotePlugin._clipboard.emit('content-changed');
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+
+        expect(remotePlugin._remoteSerial).toBe(serial);
         expect(remotePlugin._pendingEchoes).toEqual([]);
+    });
+
+    it('keeps a received file reported again while receiving another', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        await remotePlugin._handleFile(filePacket('kept.vcf'));
+        const dir = remotePlugin._currentDir;
+        const content = remotePlugin._clipboard.content;
+
+        // The device starts sending another file
+        const transfer = pendingTransfer();
+        remotePlugin.device.createTransfer.and.returnValue(transfer);
+        const received = remotePlugin._handleFile(filePacket('next.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        // A clipboard manager takes over the clipboard with the same file
+        remotePlugin._clipboard._setContent({...content});
+        await received;
+        await remotePlugin.clearCache();
+
+        expect(remotePlugin._currentDir).toBe(dir);
+        expect(dir.query_exists(null)).toBeTrue();
+    });
+
+    it('checks the format of a received image before decoding it', async function () {
+        const cancellable = new Gio.Cancellable();
+
+        await expectAsync(remotePlugin._loadImage(
+            Utils.getDataFile('album.png'), 'jpeg', cancellable))
+            .toBeRejectedWithError(/Unexpected image format/);
+    });
+
+    it('removes image data once decoded', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await decodeImage(new GLib.Bytes(contents));
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        const names = listChildren(Gio.File.new_for_path(Config.RUNTIMEDIR));
+        expect(names.filter(name => name.startsWith('clipboard-image-')))
+            .toEqual([]);
     });
 
     it('does not decode images with too many pixels', async function () {

@@ -6,6 +6,8 @@ import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
+import Config from '../../config.js';
+
 
 /**
  * The maximum size of a file or image shared through the clipboard, which is
@@ -131,14 +133,20 @@ export function getImageInfo(file, cancellable = null) {
  *
  * @param {Gio.File} file - An image file
  * @param {Gio.Cancellable} [cancellable] - A cancellable
- * @returns {Promise<Array>} The GdkPixbuf name of the format and a pixbuf
+ * @param {string} [expectedFormat] - The GdkPixbuf name of the only format
+ *   accepted, if any
+ * @returns {Promise<GdkPixbuf.Pixbuf>} A pixbuf
  */
-export async function decodeImageFile(file, cancellable = null) {
-    // Check the dimensions before decoding the image
+export async function decodeImageFile(file, cancellable = null,
+    expectedFormat = null) {
+    // Check the format and dimensions before decoding the image
     const [format, width, height] = await getImageInfo(file, cancellable);
 
     if (format === null)
         throw new Error('Unsupported image format');
+
+    if (expectedFormat !== null && format.get_name() !== expectedFormat)
+        throw new Error(`Unexpected image format: ${format.get_name()}`);
 
     if (width * height > MAX_IMAGE_PIXELS)
         throw new Error(`Image is too large: ${width}x${height}`);
@@ -157,11 +165,52 @@ export async function decodeImageFile(file, cancellable = null) {
                 });
         });
 
-        return [format.get_name(),
-            pixbuf.apply_embedded_orientation() ?? pixbuf];
+        return pixbuf.apply_embedded_orientation() ?? pixbuf;
     } finally {
         stream.close(null);
     }
+}
+
+
+/**
+ * The prefix of files holding image data while it is decoded.
+ */
+const IMAGE_PREFIX = 'clipboard-image-';
+
+
+let imageDirectory = null;
+
+
+/**
+ * Get the directory for image data being decoded, removing any files left
+ * there by a previous instance of the service the first time.
+ *
+ * @returns {Gio.File} The directory
+ */
+function getImageDirectory() {
+    if (imageDirectory !== null)
+        return imageDirectory;
+
+    GLib.mkdir_with_parents(Config.RUNTIMEDIR, 448);
+    imageDirectory = Gio.File.new_for_path(Config.RUNTIMEDIR);
+
+    try {
+        const iter = imageDirectory.enumerate_children(
+            Gio.FILE_ATTRIBUTE_STANDARD_NAME,
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+
+        let info;
+        while ((info = iter.next_file(null)) !== null) {
+            if (info.get_name().startsWith(IMAGE_PREFIX))
+                iter.get_child(info).delete(null);
+        }
+
+        iter.close(null);
+    } catch (e) {
+        debug(e);
+    }
+
+    return imageDirectory;
 }
 
 
@@ -180,18 +229,15 @@ export async function decodeImage(bytes, cancellable = null) {
         throw new Error('Image is too large');
 
     // The dimensions can only be read without blocking from a file, which is
-    // kept in memory and only readable by the user
-    const file = Gio.File.new_for_path(GLib.build_filenamev([
-        GLib.get_user_runtime_dir(),
-        `gsconnect-image-${GLib.uuid_string_random()}`,
-    ]));
+    // only readable by the user
+    const file = getImageDirectory().get_child(
+        `${IMAGE_PREFIX}${GLib.uuid_string_random()}`);
 
     try {
         await file.replace_contents_bytes_async(bytes, null, false,
             Gio.FileCreateFlags.PRIVATE, cancellable);
 
-        const [, pixbuf] = await decodeImageFile(file, cancellable);
-        return pixbuf;
+        return await decodeImageFile(file, cancellable);
     } finally {
         file.delete_async(GLib.PRIORITY_DEFAULT, null).catch(e => {
             debug(e);

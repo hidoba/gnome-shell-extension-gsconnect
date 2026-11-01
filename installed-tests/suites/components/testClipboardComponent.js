@@ -323,6 +323,30 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(clipboard._setImage).toBeNull();
     });
 
+    it('recognizes an image it set until another replaces it', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        clipboard._ownSets = 0;
+        spyOn(clipboard._clipboard, 'set_image');
+        spyOn(clipboard._clipboard, 'request_contents');
+
+        await clipboard.setImage(new GLib.Bytes(PNG[1]), 'first');
+        clipboard._applyUpdate({type: 'image', mimetype: 'image/png'}, false);
+
+        // Setting another image is cancelled while it is decoded
+        const cancellable = new Gio.Cancellable();
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]), 'second',
+            cancellable);
+        expect((await clipboard.getImage()).checksum).toBe('first');
+
+        cancellable.cancel();
+        await expectAsync(result).toBeRejected();
+        clipboard._applyUpdate({type: 'image', mimetype: 'image/png'}, false);
+
+        expect((await clipboard.getImage()).checksum).toBe('first');
+        expect(clipboard._clipboard.request_contents).not.toHaveBeenCalled();
+    });
+
     it('doesn\'t decode a copied image with too many pixels', async function () {
         const display = Gdk.Display.get_default();
         clipboard._clipboard = Gtk.Clipboard.get_default(display);

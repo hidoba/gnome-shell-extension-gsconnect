@@ -430,8 +430,9 @@ const Clipboard = GObject.registerClass({
      *   clipboard changed or it was cancelled before it could be
      */
     async setImage(bytes, checksum = null, cancellable = null) {
+        // The image in the clipboard is still recognized until this one
+        // replaces it
         const setSerial = ++this._setSerial;
-        this._setImage = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const clipboard = this._clipboard;
@@ -448,8 +449,7 @@ const Clipboard = GObject.registerClass({
                 return false;
 
             // The image is recognized without reading it back
-            if (checksum !== null)
-                this._setImage = {bytes, checksum};
+            this._setImage = checksum !== null ? {bytes, checksum} : null;
 
             this._ownSets++;
             clipboard.set_image(pixbuf);
@@ -457,8 +457,7 @@ const Clipboard = GObject.registerClass({
         } else if (this._clipboard instanceof Gio.DBusProxy) {
             // The image is read back as the same data, so it is recognized
             // without decoding it again
-            if (checksum !== null)
-                this._setImage = {bytes, checksum};
+            this._setImage = checksum !== null ? {bytes, checksum} : null;
 
             await this._clipboard.call('SetValue',
                 this._createValue(bytes, 'image/png'),
