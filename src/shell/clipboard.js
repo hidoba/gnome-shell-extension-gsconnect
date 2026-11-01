@@ -12,14 +12,15 @@ import * as DBus from '../service/utils/dbus.js';
 
 
 /*
- * DBus Interface Info
- */
-/*
  * The maximum size of a value read from the clipboard, which is the largest
  * file or image the service shares
  */
 const MAX_VALUE_SIZE = 50 * 1024 * 1024;
 
+
+/*
+ * DBus Interface Info
+ */
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const DBUS_PATH = '/org/gnome/Shell/Extensions/GSConnect/Clipboard';
 const DBUS_NODE = Gio.DBusNodeInfo.new_for_xml(`

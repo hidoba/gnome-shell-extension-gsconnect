@@ -15,6 +15,19 @@ const {default: Clipboard} = await import(
 );
 
 
+// Image data is decoded in the runtime directory, which must not be that of
+// a running service
+let tmpdir;
+
+beforeAll(function () {
+    tmpdir = Utils.isolateDirectories();
+});
+
+afterAll(function () {
+    Utils.removeDirectory(tmpdir);
+});
+
+
 describe('The Clipboard component', function () {
     let clipboard;
     let gtkClipboard;
@@ -354,6 +367,20 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         // The clipboard portal goes away, for example when GNOME Shell restarts
         clipboard._onNameVanished(null, null);
+        clipboard._disconnectClipboard();
+
+        expect(clipboard._setImage).toBeNull();
+        expect(clipboard._image).toBeNull();
+    });
+
+    it('forgets images when the clipboard portal appears', async function () {
+        clipboard._setImage = {bytes: new GLib.Bytes(PNG[1]), checksum: 'old'};
+        clipboard._image = Promise.resolve(clipboard._setImage);
+        spyOn(clipboard, '_onOwnerChange');
+        spyOn(Gio.DBusProxy.prototype, 'init_async').and.resolveTo(true);
+
+        // GNOME Shell starts exporting its clipboard
+        await clipboard._onNameAppeared(null, null, null);
         clipboard._disconnectClipboard();
 
         expect(clipboard._setImage).toBeNull();

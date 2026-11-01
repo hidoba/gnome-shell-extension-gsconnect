@@ -286,11 +286,12 @@ Plugin.prototype.awaitPacket = _awaitPacket;
 
 
 /**
- * Create temporary directories used by GSConnect.
+ * Create temporary directories used by GSConnect, so tests don't affect a
+ * running service.
  *
  * @returns {string} The root temporary directory
  */
-function isolateDirectories() {
+export function isolateDirectories() {
     const tmpdir = GLib.Dir.make_tmp('gsconnect.XXXXXX');
 
     Config.CACHEDIR = GLib.build_filenamev([tmpdir, 'cache']);
@@ -327,7 +328,7 @@ export async function mockComponents() {
  *
  * @param {Gio.File|string} file - The file or path to delete
  */
-function removeDirectory(file) {
+export function removeDirectory(file) {
     try {
         if (typeof file === 'string')
             file = Gio.File.new_for_path(file);

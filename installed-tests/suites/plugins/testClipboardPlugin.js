@@ -1145,6 +1145,25 @@ describe('The clipboard plugin', function () {
         expect(dir.query_exists(null)).toBeTrue();
     });
 
+    it('ignores an image read superseded by the next applied image', async function () {
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+        const serial = remotePlugin._remoteSerial;
+
+        // Two images are applied, and the first is reported, but the second
+        // replaces it while it is read
+        remotePlugin._expectEcho({type: 'image', checksum: 'first'});
+        remotePlugin._expectEcho({type: 'image', checksum: 'second'});
+        spyOn(remotePlugin._clipboard, 'getImage').and.resolveTo(null);
+        remotePlugin._clipboard._setContent({type: 'image', mimetype: 'image/png'});
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+
+        expect(remotePlugin._remoteSerial).toBe(serial);
+        expect(remotePlugin._pendingEchoes).toEqual([
+            {type: 'image', checksum: 'second'},
+        ]);
+        remotePlugin._pendingEchoes = [];
+    });
+
     it('checks the format of a received image before decoding it', async function () {
         const cancellable = new Gio.Cancellable();
         spyOn(GdkPixbuf.Pixbuf, 'new_from_stream_async').and.callThrough();

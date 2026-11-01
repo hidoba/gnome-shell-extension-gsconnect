@@ -9,14 +9,15 @@ import GObject from 'gi://GObject';
 import * as DBus from './service/utils/dbus.js';
 
 /*
- * DBus Interface Info
- */
-/*
  * The maximum size of a value read from the clipboard, which is the largest
  * file or image the service shares
  */
 const MAX_VALUE_SIZE = 50 * 1024 * 1024;
 
+
+/*
+ * DBus Interface Info
+ */
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const DBUS_PATH = '/org/gnome/Shell/Extensions/GSConnect/Clipboard';
 const DBUS_NODE = Gio.DBusNodeInfo.new_for_xml(`
@@ -257,7 +258,7 @@ export const Clipboard = GObject.registerClass(
                 Gio.SubprocessFlags.STDOUT_PIPE |
                 Gio.SubprocessFlags.STDERR_SILENCE);
             const stdout = proc.get_stdout_pipe();
-            const chunks = [];
+            const output = Gio.MemoryOutputStream.new_resizable();
             let size = 0;
 
             try {
@@ -284,7 +285,9 @@ export const Clipboard = GObject.registerClass(
                         });
                     }
 
-                    chunks.push(chunk.toArray());
+                    // The data is only copied once, into the output
+                    if (chunk.get_size() > 0)
+                        output.write_bytes(chunk, null);
                 } while (chunk.get_size() > 0);
 
                 await proc.wait_check_async(null);
@@ -295,15 +298,9 @@ export const Clipboard = GObject.registerClass(
                 stdout.close(null);
             }
 
-            const data = new Uint8Array(size);
-            let offset = 0;
+            output.close(null);
 
-            for (const chunk of chunks) {
-                data.set(chunk, offset);
-                offset += chunk.length;
-            }
-
-            return new GLib.Bytes(data);
+            return output.steal_as_bytes();
         }
 
         /**

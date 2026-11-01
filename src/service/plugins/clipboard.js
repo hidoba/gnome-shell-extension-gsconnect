@@ -600,6 +600,7 @@ const ClipboardPlugin = GObject.registerClass({
         const remoteSerial = this._remoteSerial;
 
         let image = null;
+        let readFailed = false;
 
         try {
             image = await this._clipboard.getImage();
@@ -608,14 +609,18 @@ const ClipboardPlugin = GObject.registerClass({
                 return;
 
             debug(e, this.device.name);
+            readFailed = true;
         }
 
-        // Newer content from either side takes precedence
-        if (this._isSuperseded(localSerial, remoteSerial))
+        // Newer content from either side takes precedence. No image is
+        // returned if the clipboard changed again while it was read, which
+        // is reported separately.
+        if (this._isSuperseded(localSerial, remoteSerial) ||
+            (image === null && !readFailed))
             return;
 
         // An image that can't be read is not the applied one, which could be
-        if (image !== null) {
+        if (!readFailed) {
             if (image.checksum === applied.checksum)
                 return;
 

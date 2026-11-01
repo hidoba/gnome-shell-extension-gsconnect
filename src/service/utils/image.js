@@ -178,7 +178,10 @@ export async function decodeImageFile(file, cancellable = null,
 const IMAGE_PREFIX = 'clipboard-image-';
 
 
-let imageDirectory = null;
+/**
+ * The path of the directory for image data that was last cleaned up.
+ */
+let cleanedPath = null;
 
 
 /**
@@ -188,14 +191,17 @@ let imageDirectory = null;
  * @returns {Gio.File} The directory
  */
 function getImageDirectory() {
-    if (imageDirectory !== null)
-        return imageDirectory;
+    const path = Config.RUNTIMEDIR;
+    GLib.mkdir_with_parents(path, 448);
+    const dir = Gio.File.new_for_path(path);
 
-    GLib.mkdir_with_parents(Config.RUNTIMEDIR, 448);
-    imageDirectory = Gio.File.new_for_path(Config.RUNTIMEDIR);
+    if (cleanedPath === path)
+        return dir;
+
+    cleanedPath = path;
 
     try {
-        const iter = imageDirectory.enumerate_children(
+        const iter = dir.enumerate_children(
             Gio.FILE_ATTRIBUTE_STANDARD_NAME,
             Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
 
@@ -210,7 +216,7 @@ function getImageDirectory() {
         debug(e);
     }
 
-    return imageDirectory;
+    return dir;
 }
 
 
