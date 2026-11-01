@@ -946,6 +946,7 @@ const ClipboardPlugin = GObject.registerClass({
                 Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC,
                 Gio.FILE_ATTRIBUTE_TIME_CHANGED,
                 Gio.FILE_ATTRIBUTE_TIME_CHANGED_USEC,
+                Gio.FILE_ATTRIBUTE_UNIX_INODE,
             ].join(','),
             Gio.FileQueryInfoFlags.NONE,
             GLib.PRIORITY_DEFAULT,
@@ -967,8 +968,10 @@ const ClipboardPlugin = GObject.registerClass({
             return;
 
         // A file is only sent again if it changed since it was last sent, or
-        // if that can't be told from its modification time. The status
-        // change time catches files replaced with their modification time.
+        // if that can't be told from its modification time. The inode and
+        // status change time catch files replaced with their modification
+        // time, although the latter also changes with the file's permissions
+        // or extended attributes. Missing attributes read as 0.
         const version = info.has_attribute(Gio.FILE_ATTRIBUTE_TIME_MODIFIED)
             ? [
                 info.get_size(),
@@ -976,6 +979,7 @@ const ClipboardPlugin = GObject.registerClass({
                 info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC),
                 info.get_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_CHANGED),
                 info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_TIME_CHANGED_USEC),
+                info.get_attribute_uint64(Gio.FILE_ATTRIBUTE_UNIX_INODE),
             ].join(':')
             : null;
 

@@ -1211,12 +1211,62 @@ describe('The clipboard plugin', function () {
             await localPlugin.clipboardPush.calls.mostRecent().returnValue;
         };
 
-        const edit = (contents, modified) => {
-            file.replace_contents(contents, null, false,
-                Gio.FileCreateFlags.NONE, null);
+        const setModified = modified => {
             file.set_attribute_uint64(Gio.FILE_ATTRIBUTE_TIME_MODIFIED,
                 modified, Gio.FileQueryInfoFlags.NONE, null);
         };
+
+        // Replaces the file with a new one
+        const edit = (contents, modified) => {
+            file.replace_contents(contents, null, false,
+                Gio.FileCreateFlags.NONE, null);
+            setModified(modified);
+        };
+
+        const getChanged = () => {
+            const info = file.query_info('time::changed,time::changed-usec',
+                Gio.FileQueryInfoFlags.NONE, null);
+
+            return `${info.get_attribute_uint64('time::changed')}:` +
+                `${info.get_attribute_uint32('time::changed-usec')}`;
+        };
+
+        // Overwrites the file in place, until its status change time differs
+        // even where it is only updated every few milliseconds
+        const overwrite = async (contents, modified) => {
+            const changed = getChanged();
+
+            do {
+                await new Promise(resolve => {
+                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1, () => {
+                        resolve();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                });
+
+                const stream = file.open_readwrite(null);
+                stream.output_stream.write_all(
+                    new TextEncoder().encode(contents), null);
+                stream.close(null);
+                setModified(modified);
+            } while (getChanged() === changed);
+        };
+
+        // Hides the status change time, as if it had not changed
+        let hideChanged = false;
+        const getUint64 = Gio.FileInfo.prototype.get_attribute_uint64;
+        spyOn(Gio.FileInfo.prototype, 'get_attribute_uint64').and.callFake(
+            function (name) {
+                return hideChanged && name === Gio.FILE_ATTRIBUTE_TIME_CHANGED
+                    ? 0 : getUint64.call(this, name);
+            });
+        const getUint32 = Gio.FileInfo.prototype.get_attribute_uint32;
+        spyOn(Gio.FileInfo.prototype, 'get_attribute_uint32').and.callFake(
+            function (name) {
+                return hideChanged &&
+                    name === Gio.FILE_ATTRIBUTE_TIME_CHANGED_USEC
+                    ? 0 : getUint32.call(this, name);
+            });
 
         localPlugin.settings.set_boolean('send-content', true);
 
@@ -1236,14 +1286,23 @@ describe('The clipboard plugin', function () {
 
             // Pulling the clipboard doesn't make it content from the device
             localPlugin.clipboardPull();
+            hideChanged = true;
             edit('other', 1000000001);
             await copy();
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(3);
 
-            // An edit that keeps the modification time is noticed too
+            // A replacement that keeps the modification time is noticed by
+            // the new file
             edit('again', 1000000001);
             await copy();
+            hideChanged = false;
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(4);
+
+            // An edit in place that keeps the modification time is noticed by
+            // the status change time
+            await overwrite('final', 1000000001);
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(5);
         } finally {
             localPlugin.settings.set_boolean('send-content', false);
         }
