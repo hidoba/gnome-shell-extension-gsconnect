@@ -1164,6 +1164,36 @@ describe('The clipboard plugin', function () {
         remotePlugin._pendingEchoes = [];
     });
 
+    it('does not read a copied image again after failing to', async function () {
+        remotePlugin.settings.set_boolean('send-content', true);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+        spyOn(remotePlugin, 'clipboardPush').and.callThrough();
+        spyOn(remotePlugin._clipboard, 'getImage').and.rejectWith(
+            new Error('Image is too large'));
+
+        try {
+            remotePlugin._expectEcho({type: 'image', checksum: 'applied'});
+            remotePlugin._clipboard._setContent({type: 'image', mimetype: 'image/png'});
+            await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+            expect(remotePlugin.clipboardPush).toHaveBeenCalledTimes(1);
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('keeps the name of a received file on one line', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+
+        await remotePlugin._handleFile(filePacket('two\nlines\r.vcf'));
+
+        const [uri] = remotePlugin._clipboard.setFile.calls.mostRecent().args;
+        expect(Gio.File.new_for_uri(uri).get_basename()).toBe('two_lines_.vcf');
+    });
+
     it('checks the format of a received image before decoding it', async function () {
         const cancellable = new Gio.Cancellable();
         spyOn(GdkPixbuf.Pixbuf, 'new_from_stream_async').and.callThrough();

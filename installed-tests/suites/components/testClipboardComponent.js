@@ -387,6 +387,41 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(clipboard._image).toBeNull();
     });
 
+    it('drops an image read when the clipboard changes meanwhile', async function () {
+        clipboard._settings.set_boolean('clipboard-files', true);
+
+        for (const fail of [false, true]) {
+            portal = mockPortal({'image/png': PNG[1]});
+            clipboard._clipboard = portal;
+            await clipboard._onOwnerChange();
+
+            // The image is replaced by text while it is read
+            let finish;
+            const call = portal.call;
+            portal.call = (method, params) => {
+                if (method !== 'GetValue')
+                    return call(method, params);
+
+                return new Promise((resolve, reject) => {
+                    finish = () => fail
+                        ? reject(new Error('image/png not available'))
+                        : resolve(call(method, params));
+                });
+            };
+
+            const image = clipboard.getImage();
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+            portal.call = call;
+            clipboard._clipboard = mockPortal({
+                'text/plain;charset=utf-8': 'replaced',
+            });
+            await clipboard._onOwnerChange();
+            finish();
+
+            expect(await image).toBeNull();
+        }
+    });
+
     it('doesn\'t decode a copied image with too many pixels', async function () {
         const display = Gdk.Display.get_default();
         clipboard._clipboard = Gtk.Clipboard.get_default(display);

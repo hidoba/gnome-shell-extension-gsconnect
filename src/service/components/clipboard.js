@@ -363,13 +363,16 @@ const Clipboard = GObject.registerClass({
         if (this._image === null) {
             const serial = this._serial;
 
-            this._image = this._readImage(this._content.mimetype).then(image => {
-                // Drop the result if the clipboard changed in the meantime
-                if (serial !== this._serial)
-                    return null;
+            // Drop the result if the clipboard changed in the meantime,
+            // including a failure to read an image that was replaced
+            this._image = this._readImage(this._content.mimetype).then(
+                image => serial === this._serial ? image : null,
+                e => {
+                    if (serial !== this._serial)
+                        return null;
 
-                return image;
-            });
+                    throw e;
+                });
 
             this._image.catch(() => {
                 if (serial === this._serial)

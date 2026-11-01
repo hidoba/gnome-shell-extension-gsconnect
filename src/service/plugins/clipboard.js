@@ -105,8 +105,10 @@ const MAX_BASENAME = 200;
  * @returns {string} A file name
  */
 function getSafeBasename(filename) {
-    // Collapse to a basename, so it can't escape the receive directory
-    const basename = GLib.path_get_basename(filename);
+    // Collapse to a basename, so it can't escape the receive directory, and
+    // replace control characters, so its path is a single line of text
+    const basename = GLib.path_get_basename(filename)
+        .replace(/\p{Cc}/gu, '_');
 
     if (!basename || basename === '.' || basename === '..' ||
         basename.includes('/'))
@@ -640,8 +642,9 @@ const ClipboardPlugin = GObject.registerClass({
 
         this._supersedeRemoteContent({type: 'image'});
 
-        // Pushing was superseded along with the remote content
-        if (this.settings.get_boolean('send-content'))
+        // Pushing was superseded along with the remote content, unless the
+        // image couldn't be read for it either
+        if (!readFailed && this.settings.get_boolean('send-content'))
             this.clipboardPush();
     }
 
