@@ -14,6 +14,12 @@ import * as DBus from '../service/utils/dbus.js';
 /*
  * DBus Interface Info
  */
+/*
+ * The maximum size of a value read from the clipboard, which is the largest
+ * file or image the service shares
+ */
+const MAX_VALUE_SIZE = 50 * 1024 * 1024;
+
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const DBUS_PATH = '/org/gnome/Shell/Extensions/GSConnect/Clipboard';
 const DBUS_NODE = Gio.DBusNodeInfo.new_for_xml(`
@@ -240,15 +246,26 @@ export const Clipboard = GObject.registerClass({
 
             const stream = Gio.MemoryOutputStream.new_resizable();
 
+            // Transfer one byte more than allowed, to tell if it's too large
             this._selection.transfer_async(
                 Meta.SelectionType.SELECTION_CLIPBOARD,
-                mimetype, -1,
+                mimetype, MAX_VALUE_SIZE + 1,
                 stream, null,
                 (selection, res) => {
                     try {
                         selection.transfer_finish(res);
+                        stream.close(null);
 
-                        resolve(stream.steal_as_bytes());
+                        const bytes = stream.steal_as_bytes();
+
+                        if (bytes.get_size() > MAX_VALUE_SIZE) {
+                            throw new Gio.DBusError({
+                                code: Gio.DBusError.LIMITS_EXCEEDED,
+                                message: `${mimetype} is too large`,
+                            });
+                        }
+
+                        resolve(bytes);
                     } catch (e) {
                         reject(e);
                     }

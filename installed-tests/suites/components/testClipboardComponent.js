@@ -347,6 +347,19 @@ describe('The Clipboard component with a clipboard portal', function () {
         expect(clipboard._clipboard.request_contents).not.toHaveBeenCalled();
     });
 
+    it('forgets images when the clipboard is replaced', function () {
+        clipboard._setImage = {bytes: new GLib.Bytes(PNG[1]), checksum: 'old'};
+        clipboard._image = Promise.resolve(clipboard._setImage);
+        spyOn(clipboard, '_onOwnerChange');
+
+        // The clipboard portal goes away, for example when GNOME Shell restarts
+        clipboard._onNameVanished(null, null);
+        clipboard._disconnectClipboard();
+
+        expect(clipboard._setImage).toBeNull();
+        expect(clipboard._image).toBeNull();
+    });
+
     it('doesn\'t decode a copied image with too many pixels', async function () {
         const display = Gdk.Display.get_default();
         clipboard._clipboard = Gtk.Clipboard.get_default(display);

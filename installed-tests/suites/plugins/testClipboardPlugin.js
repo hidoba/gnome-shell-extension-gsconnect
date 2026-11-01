@@ -1147,10 +1147,32 @@ describe('The clipboard plugin', function () {
 
     it('checks the format of a received image before decoding it', async function () {
         const cancellable = new Gio.Cancellable();
+        spyOn(GdkPixbuf.Pixbuf, 'new_from_stream_async').and.callThrough();
 
         await expectAsync(remotePlugin._loadImage(
             Utils.getDataFile('album.png'), 'jpeg', cancellable))
             .toBeRejectedWithError(/Unexpected image format/);
+        expect(GdkPixbuf.Pixbuf.new_from_stream_async).not.toHaveBeenCalled();
+    });
+
+    it('treats a copied image that can\'t be read as a copy', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        // An applied image is still expected, but the copied image is too
+        // large to be read
+        remotePlugin._expectEcho({type: 'image', checksum: 'applied'});
+        spyOn(remotePlugin._clipboard, 'getImage').and.rejectWith(
+            new Error('Image is too large'));
+        remotePlugin._clipboard._setContent({type: 'image', mimetype: 'image/png'});
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
     });
 
     it('removes image data once decoded', async function () {

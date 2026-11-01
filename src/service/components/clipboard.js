@@ -213,6 +213,7 @@ const Clipboard = GObject.registerClass({
                 return;
 
             this._clipboard = clipboard;
+            this._forgetImages();
             this._ownerChangeId = this._clipboard.connect('g-signal',
                 this._onOwnerChange.bind(this));
 
@@ -249,12 +250,22 @@ const Clipboard = GObject.registerClass({
 
         const display = Gdk.Display.get_default();
         this._clipboard = Gtk.Clipboard.get_default(display);
+        this._forgetImages();
 
         this._ownSets = 0;
         this._ownerChangeId = this._clipboard.connect('owner-change',
             this._onGtkOwnerChange.bind(this));
 
         this._onOwnerChange();
+    }
+
+    /**
+     * Forget images read or set, which are not recognized in another
+     * clipboard.
+     */
+    _forgetImages() {
+        this._image = null;
+        this._setImage = null;
     }
 
     _onGtkOwnerChange() {

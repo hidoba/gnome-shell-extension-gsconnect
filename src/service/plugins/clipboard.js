@@ -599,13 +599,23 @@ const ClipboardPlugin = GObject.registerClass({
         const localSerial = this._localSerial;
         const remoteSerial = this._remoteSerial;
 
-        try {
-            const image = await this._clipboard.getImage();
+        let image = null;
 
-            // Newer content from either side takes precedence
-            if (this._isSuperseded(localSerial, remoteSerial) || image === null)
+        try {
+            image = await this._clipboard.getImage();
+        } catch (e) {
+            if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 return;
 
+            debug(e, this.device.name);
+        }
+
+        // Newer content from either side takes precedence
+        if (this._isSuperseded(localSerial, remoteSerial))
+            return;
+
+        // An image that can't be read is not the applied one, which could be
+        if (image !== null) {
             if (image.checksum === applied.checksum)
                 return;
 
@@ -621,16 +631,13 @@ const ClipboardPlugin = GObject.registerClass({
                 this._pendingEchoes.splice(0, index);
                 return;
             }
-
-            this._supersedeRemoteContent({type: 'image'});
-
-            // Pushing was superseded along with the remote content
-            if (this.settings.get_boolean('send-content'))
-                this.clipboardPush();
-        } catch (e) {
-            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                debug(e, this.device.name);
         }
+
+        this._supersedeRemoteContent({type: 'image'});
+
+        // Pushing was superseded along with the remote content
+        if (this.settings.get_boolean('send-content'))
+            this.clipboardPush();
     }
 
     /**

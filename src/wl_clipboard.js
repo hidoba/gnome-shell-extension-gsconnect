@@ -11,6 +11,12 @@ import * as DBus from './service/utils/dbus.js';
 /*
  * DBus Interface Info
  */
+/*
+ * The maximum size of a value read from the clipboard, which is the largest
+ * file or image the service shares
+ */
+const MAX_VALUE_SIZE = 50 * 1024 * 1024;
+
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const DBUS_PATH = '/org/gnome/Shell/Extensions/GSConnect/Clipboard';
 const DBUS_NODE = Gio.DBusNodeInfo.new_for_xml(`
@@ -240,6 +246,67 @@ export const Clipboard = GObject.registerClass(
         }
 
         /**
+         * Run wl-paste with {@link args} and return its output, stopping it
+         * if the output is larger than {@link MAX_VALUE_SIZE}.
+         *
+         * @param {string[]} args - Arguments for wl-paste
+         * @returns {Promise<GLib.Bytes>} The output of wl-paste
+         */
+        async _wlPasteLimited(args) {
+            const proc = Gio.Subprocess.new(['wl-paste', ...args],
+                Gio.SubprocessFlags.STDOUT_PIPE |
+                Gio.SubprocessFlags.STDERR_SILENCE);
+            const stdout = proc.get_stdout_pipe();
+            const chunks = [];
+            let size = 0;
+
+            try {
+                let chunk;
+
+                do {
+                    chunk = await new Promise((resolve, reject) => {
+                        stdout.read_bytes_async(65536, GLib.PRIORITY_DEFAULT,
+                            null, (stream, res) => {
+                                try {
+                                    resolve(stream.read_bytes_finish(res));
+                                } catch (e) {
+                                    reject(e);
+                                }
+                            });
+                    });
+
+                    size += chunk.get_size();
+
+                    if (size > MAX_VALUE_SIZE) {
+                        throw new Gio.DBusError({
+                            code: Gio.DBusError.LIMITS_EXCEEDED,
+                            message: 'Clipboard value is too large',
+                        });
+                    }
+
+                    chunks.push(chunk.toArray());
+                } while (chunk.get_size() > 0);
+
+                await proc.wait_check_async(null);
+            } catch (e) {
+                proc.force_exit();
+                throw e;
+            } finally {
+                stdout.close(null);
+            }
+
+            const data = new Uint8Array(size);
+            let offset = 0;
+
+            for (const chunk of chunks) {
+                data.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            return new GLib.Bytes(data);
+        }
+
+        /**
          * Get the content of the clipboard with the type {@link params}.
          *
          * @param {Array} params - [mimetype]
@@ -249,7 +316,8 @@ export const Clipboard = GObject.registerClass(
          */
         async GetValueAsync(params, invocation) {
             const [mimetype] = params;
-            const bytes = await this._wlPaste(['--no-newline', '--type', mimetype]);
+            const bytes = await this._wlPasteLimited(['--no-newline', '--type',
+                mimetype]);
 
             invocation.return_value(GLib.Variant.new_tuple([
                 GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), bytes, true),
