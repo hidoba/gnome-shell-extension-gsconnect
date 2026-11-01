@@ -16,7 +16,8 @@ import {
     encodePng,
     getImageChecksum,
     getImageFormat,
-    getImageInfo
+    getImageInfo,
+    loadBytes
 } from '../utils/image.js';
 
 
@@ -505,8 +506,8 @@ const ClipboardPlugin = GObject.registerClass({
         if (width * height > MAX_IMAGE_PIXELS)
             throw new Error(`Image is too large: ${width}x${height}`);
 
-        const [contents] = await file.load_contents_async(cancellable);
-        const pixbuf = await decodeImage(new GLib.Bytes(contents), cancellable);
+        const pixbuf = await decodeImage(await loadBytes(file, cancellable),
+            cancellable);
         cancellable.set_error_if_cancelled();
 
         let pngFile = file;
@@ -545,31 +546,66 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Supersede any content still being received or applied from the
         // device, unless this is that content being applied
-        if (!this._isAppliedContent(content)) {
-            this._cancelIncomingTransfer();
-            this._remoteSerial++;
-            this._pendingEchoes = [];
+        const applied = this._getAppliedContent(content);
 
-            // Content applied from the device may be reported again, for
-            // example by a clipboard manager, and is still in the clipboard
-            if (!isSameContent(content, this._pulledContent)) {
-                this._pulledContent = null;
-                this._currentDir = null;
-            }
-        }
+        if (applied === null)
+            this._supersedeRemoteContent(content);
+        else if (applied.type === 'image')
+            this._checkAppliedImage(applied);
 
         if (this.settings.get_boolean('send-content'))
             this.clipboardPush();
     }
 
     /**
-     * Check if a local clipboard change is the content applied from the
-     * device.
+     * Supersede any content still being received or applied from the device,
+     * because of a local clipboard change.
      *
      * @param {object} content - The local clipboard content
-     * @returns {boolean} %true if the content was applied from the device
      */
-    _isAppliedContent(content) {
+    _supersedeRemoteContent(content) {
+        this._cancelIncomingTransfer();
+        this._remoteSerial++;
+        this._pendingEchoes = [];
+
+        // Content applied from the device may be reported again, for example
+        // by a clipboard manager, and is still in the clipboard
+        if (!isSameContent(content, this._pulledContent)) {
+            this._pulledContent = null;
+            this._currentDir = null;
+        }
+    }
+
+    /**
+     * Check that a local image change assumed to be an image applied from the
+     * device is that image, and otherwise treat it as a local copy.
+     *
+     * @param {object} applied - The image applied from the device
+     */
+    async _checkAppliedImage(applied) {
+        const serial = this._localSerial;
+
+        try {
+            const image = await this._clipboard.getImage();
+
+            if (serial === this._localSerial && image !== null &&
+                image.checksum !== applied.checksum)
+                this._supersedeRemoteContent({type: 'image'});
+        } catch (e) {
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                debug(e, this.device.name);
+        }
+    }
+
+    /**
+     * Get the content applied from the device that a local clipboard change
+     * reports, if any.
+     *
+     * @param {object} content - The local clipboard content
+     * @returns {object|null} The content applied from the device, or %null if
+     *   the change is a local copy
+     */
+    _getAppliedContent(content) {
         // Images are not read just to compare them, so the first image after
         // applying one is assumed to be it
         const index = this._pendingEchoes.findIndex(pending => {
@@ -581,10 +617,11 @@ const ClipboardPlugin = GObject.registerClass({
         // Applied content is only reported once, so copying the same content
         // again is a new change. Content applied before it may not be
         // reported at all, if superseded before it was read.
-        if (index !== -1)
-            this._pendingEchoes.splice(0, index + 1);
+        if (index === -1)
+            return null;
 
-        return index !== -1;
+        const [applied] = this._pendingEchoes.splice(0, index + 1).slice(-1);
+        return applied;
     }
 
     /**
@@ -884,7 +921,9 @@ const ClipboardPlugin = GObject.registerClass({
             case 'text':
                 this._pulledContent = content;
 
-                if (this._localBuffer !== content.text) {
+                // Compare with the clipboard itself, which may have been
+                // cleared since the text was last set
+                if (!isSameContent(this._clipboard.content, content)) {
                     this._localBuffer = content.text;
                     this._localTimestamp = Date.now();
 
@@ -930,15 +969,11 @@ const ClipboardPlugin = GObject.registerClass({
         try {
             // Don't replace a local image with the same image, which may have
             // come back through another device
-            if (this._clipboard.content?.type === 'image') {
-                const image = await this._clipboard.getImage();
+            if (await this._isLocalImage(content))
+                return;
 
-                if (image?.checksum === content.checksum)
-                    return;
-            }
-
-            const file = Gio.File.new_for_uri(content.uri);
-            const [contents] = await file.load_contents_async(this.cancellable);
+            const bytes = await loadBytes(Gio.File.new_for_uri(content.uri),
+                this.cancellable);
 
             // Ignore the image if the clipboard changed on either side in the
             // meantime
@@ -946,8 +981,8 @@ const ClipboardPlugin = GObject.registerClass({
                 return;
 
             this._expectEcho(content);
-            const applied = await this._clipboard.setImage(
-                new GLib.Bytes(contents), content.checksum);
+            const applied = await this._clipboard.setImage(bytes,
+                content.checksum);
 
             if (!applied)
                 this._unexpectEcho(content);
@@ -956,6 +991,30 @@ const ClipboardPlugin = GObject.registerClass({
 
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
+        }
+    }
+
+    /**
+     * Check if the local clipboard holds an image already.
+     *
+     * @param {object} content - An image
+     * @returns {Promise<boolean>} %true if the image is in the local clipboard,
+     *   or %false if it's not or the local image can't be read
+     */
+    async _isLocalImage(content) {
+        if (this._clipboard.content?.type !== 'image')
+            return false;
+
+        try {
+            const image = await this._clipboard.getImage();
+
+            return image?.checksum === content.checksum;
+        } catch (e) {
+            if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                throw e;
+
+            debug(e, this.device.name);
+            return false;
         }
     }
 

@@ -98,6 +98,10 @@ const Clipboard = GObject.registerClass({
         this._serial = 0;
         this._nameSerial = 0;
 
+        // Incremented when the content is set, which is only reported once
+        // the clipboard owner changes
+        this._setSerial = 0;
+
         // Whether a superseded update would have emitted `content-changed`
         this._emitPending = false;
 
@@ -152,6 +156,8 @@ const Clipboard = GObject.registerClass({
             this._text = content;
             this.notify('text');
         }
+
+        this._setSerial++;
 
         if (this._clipboard instanceof Gtk.Clipboard)
             this._clipboard.set_text(content, -1);
@@ -390,20 +396,27 @@ const Clipboard = GObject.registerClass({
      *   clipboard changed before it could be
      */
     async setImage(bytes, checksum = null) {
-        this._setImage = checksum !== null ? {bytes, checksum} : null;
+        const setSerial = ++this._setSerial;
+        this._setImage = null;
 
         if (this._clipboard instanceof Gtk.Clipboard) {
             const clipboard = this._clipboard;
             const serial = this._serial;
             const pixbuf = await decodeImage(bytes, this._cancellable);
 
-            // Don't replace content copied while decoding
-            if (this._clipboard !== clipboard || serial !== this._serial)
+            // Don't replace content copied or set while decoding
+            if (this._clipboard !== clipboard || serial !== this._serial ||
+                setSerial !== this._setSerial)
                 return false;
 
             clipboard.set_image(pixbuf);
             return true;
         } else if (this._clipboard instanceof Gio.DBusProxy) {
+            // The image is read back as the same data, so it is recognized
+            // without decoding it again
+            if (checksum !== null)
+                this._setImage = {bytes, checksum};
+
             await this._clipboard.call('SetValue',
                 this._createValue(bytes, 'image/png'),
                 Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable);
@@ -424,6 +437,8 @@ const Clipboard = GObject.registerClass({
      *   {@link Clipboard.content}), or %null if no clipboard is available
      */
     setFile(uri) {
+        this._setSerial++;
+
         if (this._clipboard instanceof Gtk.Clipboard) {
             const path = Gio.File.new_for_uri(uri).get_path();
             this._clipboard.set_text(path, -1);

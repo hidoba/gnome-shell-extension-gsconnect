@@ -82,6 +82,26 @@ export async function getImageFormat(file, cancellable = null) {
 
 
 /**
+ * Load the contents of a file.
+ *
+ * @param {Gio.File} file - A file
+ * @param {Gio.Cancellable} [cancellable] - A cancellable
+ * @returns {Promise<GLib.Bytes>} The contents
+ */
+export function loadBytes(file, cancellable = null) {
+    return new Promise((resolve, reject) => {
+        file.load_bytes_async(cancellable, (_file, res) => {
+            try {
+                resolve(file.load_bytes_finish(res)[0]);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    });
+}
+
+
+/**
  * Get the format and dimensions of an image file, without decoding it.
  *
  * @param {Gio.File} file - An image file
@@ -163,37 +183,48 @@ export async function encodePng(pixbuf, cancellable = null) {
  * Get a checksum for the pixel data of a pixbuf.
  *
  * This is used to recognize an image regardless of how it was encoded. The
- * data is hashed in chunks, to avoid blocking the main loop for large images.
+ * rows are hashed without the padding between them, in chunks, to avoid
+ * blocking the main loop for large images.
  *
  * @param {GdkPixbuf.Pixbuf} pixbuf - A pixbuf
  * @param {Gio.Cancellable} [cancellable] - A cancellable
  * @returns {Promise<string>} A checksum
  */
 export async function getImageChecksum(pixbuf, cancellable = null) {
-    // Normalize to 8-bit RGBA, which has no padding between rows
-    if (!pixbuf.has_alpha)
-        pixbuf = pixbuf.add_alpha(false, 0, 0, 0);
-
+    const {width, height, rowstride} = pixbuf;
+    const channels = pixbuf.n_channels;
+    const rowLength = width * channels * pixbuf.bits_per_sample / 8;
     const pixels = pixbuf.read_pixel_bytes();
-    const size = pixels.get_size();
     const checksum = new GLib.Checksum(GLib.ChecksumType.SHA256);
 
-    for (let offset = 0; offset < size; offset += CHECKSUM_CHUNK_SIZE) {
-        if (offset > 0) {
-            await new Promise(resolve => {
-                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                    resolve();
-                    return GLib.SOURCE_REMOVE;
+    // Rows without padding are hashed as a whole
+    const rows = rowstride === rowLength
+        ? [[0, rowLength * height]]
+        : Array.from({length: height}, (_, y) => [y * rowstride, rowLength]);
+
+    let hashed = 0;
+
+    for (const [offset, length] of rows) {
+        for (let start = 0; start < length; start += CHECKSUM_CHUNK_SIZE) {
+            if (hashed >= CHECKSUM_CHUNK_SIZE) {
+                hashed = 0;
+
+                await new Promise(resolve => {
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                        resolve();
+                        return GLib.SOURCE_REMOVE;
+                    });
                 });
-            });
 
-            cancellable?.set_error_if_cancelled();
+                cancellable?.set_error_if_cancelled();
+            }
+
+            const chunk = Math.min(CHECKSUM_CHUNK_SIZE, length - start);
+            checksum.update(GLib.Bytes.new_from_bytes(pixels, offset + start,
+                chunk).toArray());
+            hashed += chunk;
         }
-
-        const length = Math.min(CHECKSUM_CHUNK_SIZE, size - offset);
-        checksum.update(GLib.Bytes.new_from_bytes(pixels, offset, length)
-            .toArray());
     }
 
-    return `${pixbuf.width}x${pixbuf.height}:${checksum.get_string()}`;
+    return `${width}x${height}x${channels}:${checksum.get_string()}`;
 }

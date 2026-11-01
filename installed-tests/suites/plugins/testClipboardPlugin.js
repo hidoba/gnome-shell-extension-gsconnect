@@ -51,7 +51,7 @@ function mockTransfer(source) {
 function pendingTransfer() {
     return {
         addFile() {},
-        start() {
+        start(cancellable) {
             return new Promise((resolve, reject) => {
                 this.cancel = jasmine.createSpy('cancel').and.callFake(() => {
                     reject(new Gio.IOErrorEnum({
@@ -59,6 +59,9 @@ function pendingTransfer() {
                         message: 'Cancelled',
                     }));
                 });
+
+                // Like a real transfer, follow the cancellable passed in
+                cancellable?.connect(() => this.cancel());
             });
         },
     };
@@ -764,7 +767,92 @@ describe('The clipboard plugin', function () {
         const expected = GLib.compute_checksum_for_bytes(
             GLib.ChecksumType.SHA256, pixbuf.read_pixel_bytes());
 
-        expect(await getImageChecksum(pixbuf)).toBe(`1200x1000:${expected}`);
+        expect(await getImageChecksum(pixbuf)).toBe(`1200x1000x4:${expected}`);
+    });
+
+    it('hashes images without the padding between rows', async function () {
+        const pixels = [10, 20, 30, 40, 50, 60, 70, 80, 90, 11, 12, 13, 14, 15,
+            16, 17, 18, 19];
+        const expected = GLib.compute_checksum_for_data(
+            GLib.ChecksumType.SHA256, pixels);
+
+        // The same pixels, with and without padding
+        const padded = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes([
+            ...pixels.slice(0, 9), 0, 0, 0, ...pixels.slice(9),
+        ]), GdkPixbuf.Colorspace.RGB, false, 8, 3, 2, 12);
+        const unpadded = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes(pixels),
+            GdkPixbuf.Colorspace.RGB, false, 8, 3, 2, 9);
+
+        expect(await getImageChecksum(padded)).toBe(`3x2x3:${expected}`);
+        expect(await getImageChecksum(unpadded)).toBe(`3x2x3:${expected}`);
+    });
+
+    it('cancels receiving a file through its cancellable', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        remotePlugin._incomingCancellable.cancel();
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
+    });
+
+    it('applies a received image if the local image can\'t be read', async function () {
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+
+        const content = {
+            type: 'image',
+            checksum: 'unreadable',
+            uri: Utils.getDataUri('album.png'),
+        };
+        remotePlugin._pulledContent = content;
+        spyOn(remotePlugin._clipboard, 'getImage').and.rejectWith(
+            new Error('Unreadable'));
+        spyOn(remotePlugin._clipboard, 'setImage').and.resolveTo(true);
+
+        await remotePlugin._applyImage(content);
+
+        expect(remotePlugin._clipboard.setImage).toHaveBeenCalled();
+    });
+
+    it('applies text again after the clipboard is cleared', function () {
+        const packet = new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'before clearing'},
+        });
+
+        remotePlugin.handlePacket(packet);
+        remotePlugin._clipboard._setContent({type: 'text', text: ''});
+        remotePlugin.handlePacket(packet);
+
+        expect(remotePlugin._clipboard.content).toEqual({
+            type: 'text',
+            text: 'before clearing',
+        });
+    });
+
+    it('treats a copied image mistaken for an applied one as a copy', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin, '_checkAppliedImage').and.callThrough();
+
+        const received = remotePlugin._handleFile(filePacket('slow.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        // An applied image is expected, but a different image is copied
+        remotePlugin._expectEcho({type: 'image', checksum: 'applied'});
+        const [, contents] = GLib.file_get_contents(
+            Utils.getDataPath('album.png'));
+        await remotePlugin._clipboard.setImage(new GLib.Bytes(contents));
+        await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
     });
 
     it('rejects files that are too large', async function () {

@@ -251,4 +251,20 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         expect(portal.calls).toEqual(['SetText']);
     });
+
+    it('doesn\'t set an image if text is set while decoding', async function () {
+        const display = Gdk.Display.get_default();
+        clipboard._clipboard = Gtk.Clipboard.get_default(display);
+        spyOn(clipboard._clipboard, 'set_image');
+        spyOn(clipboard._clipboard, 'set_text');
+
+        const result = clipboard.setImage(new GLib.Bytes(PNG[1]), 'checksum');
+        clipboard.text = 'set while decoding';
+
+        expect(await result).toBeFalse();
+        expect(clipboard._clipboard.set_image).not.toHaveBeenCalled();
+
+        // The image data is only kept for the clipboard portal
+        expect(clipboard._setImage).toBeNull();
+    });
 });

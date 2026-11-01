@@ -46,11 +46,12 @@ const Component = GObject.registerClass({
     }
 
     set text(content) {
-        if (this.text === content)
-            return;
+        // Like the real component, the text is set even if unchanged
+        if (this.text !== content) {
+            this._text = content;
+            this.notify('text');
+        }
 
-        this._text = content;
-        this.notify('text');
         this._setContent({type: 'text', text: content});
     }
 
