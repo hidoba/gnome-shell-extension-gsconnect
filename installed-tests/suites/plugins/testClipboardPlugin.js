@@ -1235,8 +1235,12 @@ describe('The clipboard plugin', function () {
         // even where it is only updated every few milliseconds
         const overwrite = async (contents, modified) => {
             const changed = getChanged();
+            const deadline = GLib.get_monotonic_time() + 2 * 1000 * 1000;
 
             do {
+                if (GLib.get_monotonic_time() > deadline)
+                    throw new Error('The status change time did not change');
+
                 await new Promise(resolve => {
                     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1, () => {
                         resolve();
@@ -1295,14 +1299,19 @@ describe('The clipboard plugin', function () {
             // the new file
             edit('again', 1000000001);
             await copy();
-            hideChanged = false;
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(4);
+
+            // Once the status change time is shown again, the file is sent
+            // again with it, to compare later edits with
+            hideChanged = false;
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(5);
 
             // An edit in place that keeps the modification time is noticed by
             // the status change time
             await overwrite('final', 1000000001);
             await copy();
-            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(5);
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(6);
         } finally {
             localPlugin.settings.set_boolean('send-content', false);
         }

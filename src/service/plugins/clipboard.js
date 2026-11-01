@@ -971,7 +971,8 @@ const ClipboardPlugin = GObject.registerClass({
         // if that can't be told from its modification time. The inode and
         // status change time catch files replaced with their modification
         // time, although the latter also changes with the file's permissions
-        // or extended attributes. Missing attributes read as 0.
+        // or extended attributes, and some FUSE file systems make up a new
+        // inode on each lookup. Missing attributes read as 0.
         const version = info.has_attribute(Gio.FILE_ATTRIBUTE_TIME_MODIFIED)
             ? [
                 info.get_size(),
