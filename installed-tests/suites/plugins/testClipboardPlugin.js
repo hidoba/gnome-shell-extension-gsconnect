@@ -1239,6 +1239,11 @@ describe('The clipboard plugin', function () {
             edit('other', 1000000001);
             await copy();
             expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(3);
+
+            // An edit that keeps the modification time is noticed too
+            edit('again', 1000000001);
+            await copy();
+            expect(localPlugin.device.createTransfer).toHaveBeenCalledTimes(4);
         } finally {
             localPlugin.settings.set_boolean('send-content', false);
         }
