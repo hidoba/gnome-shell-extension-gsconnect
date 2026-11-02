@@ -202,10 +202,16 @@ const ClipboardPlugin = GObject.registerClass({
 
         this._clipboard = Components.acquire('clipboard');
 
-        // Sharing images and files is a global setting
+        // Sharing images and files is a global setting. Transfers stop when
+        // it's disabled, but it only applies to sending once the device was
+        // told, when it connects.
         this._serviceSettings = new Gio.Settings({
             settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
         });
+        this._filesAdvertised = this._serviceSettings.get_boolean(
+            'clipboard-files');
+        this._filesChangedId = this._serviceSettings.connect(
+            'changed::clipboard-files', this._onFilesChanged.bind(this));
 
         // Watch local clipboard for changes
         this._contentChangedId = this._clipboard.connect(
@@ -249,6 +255,9 @@ const ClipboardPlugin = GObject.registerClass({
 
     connected() {
         super.connected();
+
+        this._filesAdvertised = this._serviceSettings.get_boolean(
+            'clipboard-files');
 
         // The remote clipboard may have changed while disconnected
         this._remoteContent = null;
@@ -368,7 +377,7 @@ const ClipboardPlugin = GObject.registerClass({
                         await child.delete_async(GLib.PRIORITY_DEFAULT,
                             cancellable);
                     } catch (e) {
-                        if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                        if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
                             throw e;
                     }
                 }
@@ -385,16 +394,33 @@ const ClipboardPlugin = GObject.registerClass({
      */
     async _cleanReceiveDirectory(dir) {
         // The kept directories are checked as each is reached, since they may
-        // change while cleaning up
+        // change while cleaning up. The file the device holds is kept too,
+        // since it can be pulled again after a local copy.
         const keep = child => this._currentDir?.equal(child) ||
-            this._receivingDirs.has(child.get_path());
+            this._receivingDirs.has(child.get_path()) ||
+            this._isRemoteDirectory(child);
 
         try {
             await this._deleteChildren(dir, keep, this.cancellable);
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
         }
+    }
+
+    /**
+     * Check if a directory holds the file or image the device last sent.
+     *
+     * @param {Gio.File} dir - A directory
+     * @returns {boolean} %true if it holds the device's content
+     */
+    _isRemoteDirectory(dir) {
+        const uri = this._remoteContent?.uri;
+
+        if (uri === undefined)
+            return false;
+
+        return Gio.File.new_for_uri(uri).get_parent()?.equal(dir) ?? false;
     }
 
     /**
@@ -410,7 +436,7 @@ const ClipboardPlugin = GObject.registerClass({
             await this._deleteChildren(dir);
             await dir.delete_async(GLib.PRIORITY_DEFAULT, null);
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
                 debug(e, this.device.name);
         }
     }
@@ -808,7 +834,8 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {boolean} %true if supported
      */
     _canSendFiles() {
-        if (!this._serviceSettings.get_boolean('clipboard-files'))
+        if (!this._filesAdvertised ||
+            !this._serviceSettings.get_boolean('clipboard-files'))
             return false;
 
         if (!this.device.connected)
@@ -830,6 +857,17 @@ const ClipboardPlugin = GObject.registerClass({
         return localSerial !== this._localSerial ||
             remoteSerial !== this._remoteSerial ||
             this.cancellable.is_cancelled();
+    }
+
+    /**
+     * Stop transferring images and files once sharing them is disabled.
+     */
+    _onFilesChanged() {
+        if (this._serviceSettings.get_boolean('clipboard-files'))
+            return;
+
+        this._cancelIncomingTransfer();
+        this._cancelOutgoingTransfer();
     }
 
     /**
@@ -1016,8 +1054,10 @@ const ClipboardPlugin = GObject.registerClass({
             return;
         }
 
-        // Ignore content superseded while querying the file
-        if (this._isSuperseded(localSerial, remoteSerial))
+        // Ignore content superseded while querying the file, or files no
+        // longer shared since
+        if (this._isSuperseded(localSerial, remoteSerial) ||
+            !this._canSendFiles())
             return;
 
         // A file is only sent again if it changed since it was last sent, or
@@ -1188,6 +1228,7 @@ const ClipboardPlugin = GObject.registerClass({
     destroy() {
         this._cancelIncomingTransfer();
         this._cancelOutgoingTransfer();
+        this._serviceSettings.disconnect(this._filesChangedId);
 
         if (this._clipboard && this._contentChangedId) {
             this._clipboard.disconnect(this._contentChangedId);

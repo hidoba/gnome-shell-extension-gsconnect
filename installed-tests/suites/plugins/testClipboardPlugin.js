@@ -398,8 +398,10 @@ describe('The clipboard plugin', function () {
     });
 
     it('pushes images as PNG files', async function () {
-        // The setting is shared by both plugins
+        // The setting is shared by both plugins, and applies to sending once
+        // the device reconnects
         localPlugin._serviceSettings.set_boolean('clipboard-files', true);
+        localPlugin.connected();
         localPlugin._clipboard.text = 'reset';
         await remotePlugin.awaitPacket('kdeconnect.clipboard', {
             content: 'reset',
@@ -1565,6 +1567,78 @@ describe('The clipboard plugin', function () {
         } finally {
             localPlugin.settings.set_boolean('send-content', false);
         }
+    });
+
+    it('stops receiving a file when sharing files is disabled', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        spyOn(remotePlugin._clipboard, 'setFile');
+        const settings = remotePlugin._serviceSettings;
+        settings.set_boolean('clipboard-files', true);
+
+        const received = remotePlugin._handleFile(filePacket('disabled.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        try {
+            settings.set_boolean('clipboard-files', false);
+            await received;
+        } finally {
+            settings.set_boolean('clipboard-files', true);
+        }
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+    });
+
+    it('stops sending a file when sharing files is disabled', function () {
+        const transfer = {cancel: jasmine.createSpy('cancel')};
+        localPlugin._outgoingTransfer = transfer;
+        const settings = localPlugin._serviceSettings;
+
+        try {
+            settings.set_boolean('clipboard-files', false);
+        } finally {
+            settings.set_boolean('clipboard-files', true);
+        }
+
+        expect(transfer.cancel).toHaveBeenCalled();
+    });
+
+    it('only sends files once reconnected after sharing them is enabled', function () {
+        const settings = localPlugin._serviceSettings;
+
+        try {
+            settings.set_boolean('clipboard-files', false);
+            localPlugin.connected();
+
+            // The device wasn't told files are sent when it connected
+            settings.set_boolean('clipboard-files', true);
+            expect(localPlugin._canSendFiles()).toBeFalse();
+        } finally {
+            settings.set_boolean('clipboard-files', true);
+            localPlugin.connected();
+        }
+
+        expect(localPlugin._canSendFiles()).toBeTrue();
+    });
+
+    it('keeps the file the device holds after a local copy', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        await remotePlugin._handleFile(filePacket('held.vcf'));
+        const {uri} = remotePlugin._clipboard.content;
+
+        // A local copy, which isn't sent to the device
+        remotePlugin._clipboard.text = 'copied locally';
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        expect(remotePlugin._currentDir).toBeNull();
+
+        await remotePlugin.clearCache();
+        expect(Gio.File.new_for_uri(uri).query_exists(null)).toBeTrue();
+
+        // The device's file can still be pulled
+        remotePlugin.clipboardPull();
+        expect(remotePlugin._clipboard.content.uri).toBe(uri);
     });
 
     it('keeps an existing directory it failed to create', async function () {

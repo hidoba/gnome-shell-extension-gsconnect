@@ -439,6 +439,45 @@ describe('A LAN channel service', function () {
             }
         });
 
+        it('that close a connection accepted once an upload failed', async function () {
+            let client = null;
+            let requestFailed;
+            const failure = new Promise(resolve => (requestFailed = resolve));
+
+            // The connection is accepted, but only reported once the request
+            // failed
+            const accept = Gio.SocketListener.prototype.accept_async;
+            spyOn(Gio.SocketListener.prototype, 'accept_async').and.callFake(
+                async function (...args) {
+                    const result = await accept.call(this, ...args);
+                    await failure;
+                    return result;
+                });
+
+            spyOn(localChannel, 'sendPacket').and.callFake(async request => {
+                const address = Gio.InetSocketAddress.new_from_string(
+                    '127.0.0.1', request.payloadTransferInfo.port);
+                client = await new Gio.SocketClient({enable_proxy: false})
+                    .connect_async(address, null);
+
+                throw new Error('Request failed');
+            });
+
+            const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
+            const bytes = new GLib.Bytes('upload');
+
+            try {
+                await expectAsync(localChannel.upload(packet,
+                    Gio.MemoryInputStream.new_from_bytes(bytes),
+                    bytes.get_size())).toBeRejected();
+                requestFailed();
+
+                await waitForClose(client);
+            } finally {
+                client?.close(null);
+            }
+        });
+
         it('that close a file whose size can not be read', async function () {
             const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
             const [file, stream] = Gio.File.new_tmp('gsconnect.XXXXXX');

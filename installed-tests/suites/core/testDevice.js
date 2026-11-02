@@ -3,11 +3,56 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
 
 import * as Utils from '../fixtures/utils.js';
 
 import Config from '../config.js';
+const Core = await import(`file://${Config.PACKAGE_DATADIR}/service/core.js`);
 const {default: Device} = await import(`file://${Config.PACKAGE_DATADIR}/service/device.js`);
+
+
+/*
+ * A channel that records the types of the packets it writes, or doesn't
+ * finish writing them until closed if blocked
+ */
+const TestChannel = GObject.registerClass({
+    GTypeName: 'GSConnectTestDeviceChannel',
+}, class TestChannel extends Core.Channel {
+    _init(identity, blocked = false) {
+        super._init();
+
+        this.identity = identity;
+        this.written = [];
+        this.output_stream = Gio.MemoryOutputStream.new_resizable();
+        this.output_stream.write_all_async = (data, priority, cancellable) => {
+            if (!blocked) {
+                this.written.push(JSON.parse(data).type);
+                return Promise.resolve([true, data.length]);
+            }
+
+            return new Promise((resolve, reject) => {
+                cancellable.connect(() => reject(new Gio.IOErrorEnum({
+                    code: Gio.IOErrorEnum.CANCELLED,
+                    message: 'Cancelled',
+                })));
+            });
+        };
+    }
+
+    get address() {
+        return 'test://';
+    }
+
+    readPacket() {
+        return new Promise(() => {});
+    }
+
+    close() {
+        this._closed = true;
+        this.cancellable.cancel();
+    }
+});
 
 
 describe('A device constructed from a packet', function () {
@@ -165,3 +210,35 @@ describe('A device constructed from an ID', function () {
     });
 });
 
+
+describe('A device whose channel is replaced', function () {
+    let device, identity;
+
+    beforeAll(function () {
+        identity = Utils.generateIdentity();
+        device = new Device(identity);
+        device._setPaired(true);
+    });
+
+    afterAll(function () {
+        device.setChannel(null);
+        device.destroy();
+    });
+
+    it('writes packets that were waiting to the new channel', async function () {
+        // The device stops reading, so a packet is never written
+        device.setChannel(new TestChannel(identity, true));
+        device.sendPacket({type: 'kdeconnect.stuck', body: {}});
+        device.sendPacket({type: 'kdeconnect.waiting', body: {}});
+
+        const replacement = new TestChannel(identity);
+        device.setChannel(replacement);
+        device.sendPacket({type: 'kdeconnect.later', body: {}});
+
+        await Utils.waitFor(() => replacement.written.length === 2);
+        expect(replacement.written).toEqual([
+            'kdeconnect.waiting',
+            'kdeconnect.later',
+        ]);
+    });
+});

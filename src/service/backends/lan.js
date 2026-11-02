@@ -1057,6 +1057,7 @@ export const Channel = GObject.registerClass({
         // The connection accepted from the device, if any
         let accepted = null;
         let acceptConnection = null;
+        let failed = false;
 
         try {
             // Listen for the incoming connection, which is no longer waited
@@ -1064,6 +1065,16 @@ export const Channel = GObject.registerClass({
             acceptConnection = listener.accept_async(cancellable)
                 .then(result => {
                     accepted = result[0];
+
+                    // A connection accepted once the upload failed isn't used
+                    if (failed) {
+                        accepted.close_async(GLib.PRIORITY_DEFAULT, null, null);
+                        throw new Gio.IOErrorEnum({
+                            code: Gio.IOErrorEnum.CANCELLED,
+                            message: 'Upload failed',
+                        });
+                    }
+
                     return this._encryptServer(accepted, {
                         cancellable,
                         transfer: true,
@@ -1096,6 +1107,8 @@ export const Channel = GObject.registerClass({
                 });
             }
         } catch (e) {
+            failed = true;
+
             // A connection accepted for a request that failed isn't used. A
             // handshake in progress uses its socket in another thread, which
             // shutting it down stops, and it's closed once that's done.

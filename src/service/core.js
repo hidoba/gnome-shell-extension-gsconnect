@@ -253,29 +253,65 @@ export const Channel = GObject.registerClass({
      * @param {Gio.Cancellable} [cancellable] - A cancellable
      * @returns {Promise<boolean>} %true if successful
      */
-    async sendPacket(packet, cancellable = null) {
-        // Packets are written one at a time, since a write can't start before
-        // the last one is done, and a packet that started to be written is
-        // only stopped with the channel, so it's never written in part
-        const previous = this._writing ?? null;
-        let finish;
-        const writing = new Promise(resolve => (finish = resolve));
-        this._writing = writing;
+    sendPacket(packet, cancellable = null) {
+        return new Promise((resolve, reject) => {
+            this.resendPackets([{packet, cancellable, resolve, reject}]);
+        });
+    }
 
-        try {
-            if (previous !== null)
-                await previous;
+    /**
+     * Take the packets waiting to be written, so they can be written to
+     * another channel instead.
+     *
+     * @returns {object[]} The packets, as passed to resendPackets()
+     */
+    takeUnsentPackets() {
+        const unsent = this._unsent ?? [];
+        this._unsent = [];
 
-            cancellable?.set_error_if_cancelled();
+        return unsent;
+    }
 
-            return await this.output_stream.write_all_async(
-                packet.serialize(), GLib.PRIORITY_DEFAULT, this.cancellable);
-        } finally {
-            finish();
+    /**
+     * Write packets taken from another channel, before any sent later.
+     *
+     * @param {object[]} unsent - Packets from takeUnsentPackets()
+     */
+    resendPackets(unsent) {
+        if (this._unsent === undefined)
+            this._unsent = [];
 
-            if (this._writing === writing)
-                this._writing = null;
+        this._unsent.push(...unsent);
+
+        if (!this._writing)
+            this._writePackets();
+    }
+
+    /**
+     * Write the packets waiting to be written.
+     *
+     * Packets are written one at a time, since a write can't start before the
+     * last one is done. A packet is skipped if cancelled before it's written,
+     * but once started it's only stopped with the channel, so it's never
+     * written in part.
+     */
+    async _writePackets() {
+        this._writing = true;
+        let next;
+
+        while ((next = this._unsent.shift())) {
+            try {
+                next.cancellable?.set_error_if_cancelled();
+
+                next.resolve(await this.output_stream.write_all_async(
+                    next.packet.serialize(), GLib.PRIORITY_DEFAULT,
+                    this.cancellable));
+            } catch (e) {
+                next.reject(e);
+            }
         }
+
+        this._writing = false;
     }
 
     /**

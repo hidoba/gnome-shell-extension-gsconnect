@@ -335,14 +335,22 @@ const Device = GObject.registerClass({
         if (this.channel === channel)
             return;
 
-        if (this.channel !== null)
+        // Packets waiting to be written to a replaced channel are written to
+        // the new one, first, and are dropped with it if disconnected
+        let unsent = [];
+
+        if (this.channel !== null) {
+            if (channel !== null)
+                unsent = this.channel.takeUnsentPackets();
+
             this.channel.close();
+        }
 
         this._channel = channel;
 
-        // Packets waiting to be written are dropped with the old channel.
-        // Otherwise restart the read loop and update the device metadata.
+        // Restart the read loop and update the device metadata
         if (this.channel !== null) {
+            this.channel.resendPackets(unsent);
             this._handleIdentity(this.channel.identity);
             this._readLoop(channel);
         }
