@@ -153,10 +153,6 @@ export const Channel = GObject.registerClass({
 
     set backend(backend) {
         this._backend = backend;
-
-        // The identity the device is told about when connecting, which is
-        // rebuilt for later channels when the service's capabilities change
-        this._localIdentity = backend?.identity ?? null;
     }
 
     get cancellable() {
@@ -167,7 +163,9 @@ export const Channel = GObject.registerClass({
     }
 
     /**
-     * The identity sent to the device for this channel, if known.
+     * The identity the device was told about for this channel, if known,
+     * which implementations record as they send it. The service rebuilds its
+     * identity when its capabilities change, so it may differ.
      *
      * @type {Packet|null}
      */

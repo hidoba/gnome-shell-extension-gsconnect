@@ -84,14 +84,13 @@ function pendingTransfer() {
 function shareFiles(enabled, ...plugins) {
     plugins[0]._serviceSettings.set_boolean('clipboard-files', enabled);
 
-    for (const plugin of plugins) {
-        // Like a channel connected since, with the identity rebuilt. The
-        // mock backend's own identity has no capabilities.
-        const channel = plugin.device.channel;
-        const {backend} = channel;
-        Core.ChannelService.prototype.buildIdentity.call(backend);
-        channel.backend = backend;
-    }
+    // The identity of the service, which the mock backend's lacks
+    const service = new Core.ChannelService({id: 'test', name: 'test'});
+    service.buildIdentity();
+
+    // Like a channel connected since, which records the identity it sent
+    for (const plugin of plugins)
+        plugin.device.channel._localIdentity = service.identity;
 }
 
 

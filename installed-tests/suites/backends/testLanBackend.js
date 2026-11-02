@@ -337,6 +337,43 @@ describe('A LAN channel service', function () {
             }
         });
 
+        it('that record the identity they sent', function () {
+            expect(localChannel.localIdentity).toBe(local.identity);
+            expect(remoteChannel.localIdentity).toBe(remote.identity);
+        });
+
+        it('that record an identity rebuilt before they send it', async function () {
+            // A connection that is never encrypted, so the channel stays open
+            const server = new Gio.SocketListener();
+            const port = server.add_any_inet_port(null);
+            const address = Gio.InetSocketAddress.new_from_string('127.0.0.1',
+                port);
+            const connection = await new Gio.SocketClient({
+                enable_proxy: false,
+            }).connect_async(address, null);
+
+            const channel = new Lan.Channel({
+                backend: local,
+                certificate: local.certificate,
+                host: '127.0.0.1',
+                port,
+            });
+
+            // The capabilities change after the channel is created
+            const previous = local.identity;
+            local.buildIdentity();
+            const opening = channel.open(connection).catch(() => {});
+
+            try {
+                expect(local.identity).not.toBe(previous);
+                expect(channel.localIdentity).toBe(local.identity);
+            } finally {
+                channel.close();
+                await opening;
+                server.close();
+            }
+        });
+
         it('that write packets one at a time', async function () {
             const packets = ['first', 'second', 'third'].map(name => {
                 return new Core.Packet({type: 'kdeconnect.test', body: {name}});
