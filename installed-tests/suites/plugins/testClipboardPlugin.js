@@ -614,6 +614,34 @@ describe('The clipboard plugin', function () {
         expect(Gio.File.new_for_path(path).query_exists(null)).toBeFalse();
     });
 
+    it('removes a partially received file when disconnected', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        remotePlugin.device.rejectTransfer.and.callThrough();
+
+        const received = remotePlugin._handleFile(filePacket('partial.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        const [path] = remotePlugin._receivingDirs;
+
+        // Like Device.setChannel(), the channel is gone before the plugins
+        // are told, which cancels the transfer
+        const channel = remotePlugin.device._channel;
+        remotePlugin.device._channel = null;
+        remotePlugin.device._connected = false;
+
+        try {
+            remotePlugin.disconnected();
+            await received;
+        } finally {
+            remotePlugin.device._channel = channel;
+            remotePlugin.device._connected = true;
+            remotePlugin.connected();
+        }
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(Gio.File.new_for_path(path).query_exists(null)).toBeFalse();
+    });
+
     it('cancels sending content superseded by the device', function () {
         const transfer = {cancel: jasmine.createSpy('cancel')};
         localPlugin._outgoingTransfer = transfer;

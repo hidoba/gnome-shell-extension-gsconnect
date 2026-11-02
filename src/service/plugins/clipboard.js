@@ -518,8 +518,8 @@ const ClipboardPlugin = GObject.registerClass({
 
             // Don't leave the device waiting to send the file, which may not
             // have been downloaded at all if the transfer was cancelled
-            // before connecting
-            if (!received)
+            // before connecting, unless the device is gone
+            if (!received && this.device.connected)
                 this.device.rejectTransfer(packet);
 
             if (dir !== null && dir !== this._currentDir)

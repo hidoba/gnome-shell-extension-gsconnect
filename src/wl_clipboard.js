@@ -16,6 +16,13 @@ const MAX_VALUE_SIZE = 50 * 1024 * 1024;
 
 
 /*
+ * The time in milliseconds to wait for the clipboard to be read, which is less
+ * than the default D-Bus timeout of the service's calls
+ */
+const PASTE_TIMEOUT = 20000;
+
+
+/*
  * DBus Interface Info
  */
 const DBUS_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
@@ -77,6 +84,11 @@ export const Clipboard = GObject.registerClass(
 
             this._transferring = false;
 
+            // Reads of the clipboard in progress, which are stopped when they
+            // take longer than this, or when destroyed
+            this._pastes = new Set();
+            this._pasteTimeout = PASTE_TIMEOUT;
+
             // The value waiting to be copied, while another one is copied
             this._nextCopy = null;
             this._copying = false;
@@ -118,33 +130,6 @@ export const Clipboard = GObject.registerClass(
             } catch (e) {
                 logError(e);
             }
-        }
-
-        /**
-         * Run wl-paste with {@link args} and return its output.
-         *
-         * @param {string[]} args - Arguments for wl-paste
-         * @returns {Promise<GLib.Bytes>} The output of wl-paste
-         */
-        _wlPaste(args) {
-            return new Promise((resolve, reject) => {
-                const proc = Gio.Subprocess.new(['wl-paste', ...args],
-                    Gio.SubprocessFlags.STDOUT_PIPE |
-                    Gio.SubprocessFlags.STDERR_SILENCE);
-
-                proc.communicate_async(null, null, (proc, res) => {
-                    try {
-                        const [, stdout] = proc.communicate_finish(res);
-
-                        if (proc.get_successful())
-                            resolve(stdout);
-                        else
-                            reject(new Error(`wl-paste exited with ${proc.get_exit_status()}`));
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-            });
         }
 
         /**
@@ -195,7 +180,12 @@ export const Clipboard = GObject.registerClass(
                 try {
                     bytes = await this._wlPaste(['--no-newline', '--type',
                         mimetype]);
-                } catch {
+                } catch (e) {
+                    // Other types won't be read either
+                    if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.TIMED_OUT) ||
+                        e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        throw e;
+
                     continue;
                 }
 
@@ -296,12 +286,13 @@ export const Clipboard = GObject.registerClass(
 
         /**
          * Run wl-paste with {@link args} and return its output, stopping it
-         * if the output is larger than {@link MAX_VALUE_SIZE}.
+         * if the output is larger than {@link MAX_VALUE_SIZE}, or if it isn't
+         * complete in time, since the owner of the clipboard may not respond.
          *
          * @param {string[]} args - Arguments for wl-paste
          * @returns {Promise<GLib.Bytes>} The output of wl-paste
          */
-        async _wlPasteLimited(args) {
+        async _wlPaste(args) {
             const proc = Gio.Subprocess.new(['wl-paste', ...args],
                 Gio.SubprocessFlags.STDOUT_PIPE |
                 Gio.SubprocessFlags.STDERR_SILENCE);
@@ -309,13 +300,27 @@ export const Clipboard = GObject.registerClass(
             const output = Gio.MemoryOutputStream.new_resizable();
             let size = 0;
 
+            const cancellable = new Gio.Cancellable();
+            cancellable.connect(() => proc.force_exit());
+            this._pastes.add(cancellable);
+
+            let timedOut = false;
+            let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+                this._pasteTimeout, () => {
+                    timedOut = true;
+                    timeoutId = 0;
+                    cancellable.cancel();
+
+                    return GLib.SOURCE_REMOVE;
+                });
+
             try {
                 let chunk;
 
                 do {
                     chunk = await new Promise((resolve, reject) => {
                         stdout.read_bytes_async(65536, GLib.PRIORITY_DEFAULT,
-                            null, (stream, res) => {
+                            cancellable, (stream, res) => {
                                 try {
                                     resolve(stream.read_bytes_finish(res));
                                 } catch (e) {
@@ -338,11 +343,23 @@ export const Clipboard = GObject.registerClass(
                         output.write_bytes(chunk, null);
                 } while (chunk.get_size() > 0);
 
-                await proc.wait_check_async(null);
+                await proc.wait_check_async(cancellable);
             } catch (e) {
                 proc.force_exit();
+
+                if (timedOut) {
+                    throw new Gio.IOErrorEnum({
+                        code: Gio.IOErrorEnum.TIMED_OUT,
+                        message: 'Timed out reading the clipboard',
+                    });
+                }
+
                 throw e;
             } finally {
+                if (timeoutId !== 0)
+                    GLib.Source.remove(timeoutId);
+
+                this._pastes.delete(cancellable);
                 stdout.close(null);
             }
 
@@ -361,7 +378,7 @@ export const Clipboard = GObject.registerClass(
          */
         async GetValueAsync(params, invocation) {
             const [mimetype] = params;
-            const bytes = await this._wlPasteLimited(['--no-newline', '--type',
+            const bytes = await this._wlPaste(['--no-newline', '--type',
                 mimetype]);
 
             invocation.return_value(GLib.Variant.new_tuple([
@@ -383,6 +400,9 @@ export const Clipboard = GObject.registerClass(
 
         destroy() {
             this._nextCopy = null;
+
+            for (const cancellable of this._pastes)
+                cancellable.cancel();
 
             if (this._nameId > 0) {
                 Gio.bus_unown_name(this._nameId);

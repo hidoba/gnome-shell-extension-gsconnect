@@ -56,6 +56,12 @@ case "$1" in
         echo
         ;;
     *)
+        if [ -n "$WL_STUB_HANG" ]; then
+            # Like an application that doesn't send the clipboard
+            echo $$ > "$WL_STUB_DIR/hung"
+            exec sleep 60
+        fi
+
         type=
         while [ $# -gt 0 ]; do
             [ "$1" = --type ] && { type=$2; shift; }
@@ -67,6 +73,18 @@ case "$1" in
         ;;
 esac
 `;
+
+
+/*
+ * The portal is tested on the session bus, where it must not replace the
+ * clipboard of GNOME Shell or of a running service, which would change the
+ * clipboard of the desktop
+ */
+const PORTAL_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
+const [portalRunning] = Gio.DBus.session.call_sync('org.freedesktop.DBus',
+    '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'NameHasOwner',
+    new GLib.Variant('(s)', [PORTAL_NAME]), new GLib.VariantType('(b)'),
+    Gio.DBusCallFlags.NONE, -1, null).deepUnpack();
 
 
 /**
@@ -104,7 +122,31 @@ async function copyElsewhere(data, type) {
 }
 
 
-describe('The wl-clipboard portal', function () {
+/**
+ * Get the value of the clipboard through the portal.
+ *
+ * @param {Gio.DBusProxy} proxy - A proxy for the portal
+ * @param {string} type - The mimetype
+ * @returns {Promise<GLib.Variant>} The reply
+ */
+function getValue(proxy, type) {
+    return proxy.call('GetValue', new GLib.Variant('(s)', [type]),
+        Gio.DBusCallFlags.NONE, -1, null);
+}
+
+
+/**
+ * Check whether a process exists, which it doesn't once it was reaped.
+ *
+ * @param {number} pid - A process ID
+ * @returns {boolean} Whether the process exists
+ */
+function processExists(pid) {
+    return GLib.file_test(`/proc/${pid}`, GLib.FileTest.EXISTS);
+}
+
+
+(portalRunning ? xdescribe : describe)('The wl-clipboard portal', function () {
     const PNG = GLib.file_get_contents(Utils.getDataPath('album.png'))[1];
     let tmpdir, stubDir, path, haveGnome;
     let settings, portal, clipboard;
@@ -139,6 +181,21 @@ describe('The wl-clipboard portal', function () {
                 .filter(type => type.length > 0);
         } catch {
             return [];
+        }
+    }
+
+    /**
+     * Get the process ID of the last wl-paste that didn't send the clipboard.
+     *
+     * @returns {number} A process ID, or 0 if there is none yet
+     */
+    function hungPid() {
+        try {
+            const pid = GLib.file_get_contents(`${stubDir}/hung`)[1];
+
+            return parseInt(new TextDecoder().decode(pid));
+        } catch {
+            return 0;
         }
     }
 
@@ -181,6 +238,7 @@ describe('The wl-clipboard portal', function () {
         globalThis.HAVE_GNOME = haveGnome;
         GLib.setenv('PATH', path, true);
         GLib.unsetenv('WL_STUB_DIR');
+        GLib.unsetenv('WL_STUB_HANG');
         Utils.removeDirectory(tmpdir);
     });
 
@@ -241,7 +299,13 @@ describe('The wl-clipboard portal', function () {
         await copyElsewhere(data, 'image/png');
         await Utils.waitFor(() => clipboard.content?.type === 'image');
 
-        await expectAsync(clipboard.getImage()).toBeRejected();
+        try {
+            await getValue(clipboard._clipboard, 'image/png');
+            fail('The value was read');
+        } catch (e) {
+            expect(e.matches(Gio.DBusError, Gio.DBusError.LIMITS_EXCEEDED))
+                .withContext(e.message).toBeTrue();
+        }
 
         // The clipboard is still read afterwards
         await copyElsewhere(new TextEncoder().encode('after the image'),
@@ -272,5 +336,46 @@ describe('The wl-clipboard portal', function () {
             'image/png',
             'text/plain;charset=utf-8',
         ]);
+    });
+
+    it('stops reading a clipboard that is not sent', async function () {
+        GLib.unlink(`${stubDir}/hung`);
+        GLib.setenv('WL_STUB_HANG', '1', true);
+        portal._pasteTimeout = 200;
+
+        try {
+            await expectAsync(getValue(clipboard._clipboard, 'image/png'))
+                .toBeRejected();
+        } finally {
+            GLib.unsetenv('WL_STUB_HANG');
+            portal._pasteTimeout = 20000;
+        }
+
+        const pid = hungPid();
+        expect(pid).toBeGreaterThan(0);
+        await Utils.waitFor(() => !processExists(pid));
+        expect(portal._pastes.size).toBe(0);
+    });
+
+    // This must be the last test, since it destroys the portal
+    it('stops reading the clipboard when destroyed', async function () {
+        GLib.unlink(`${stubDir}/hung`);
+        GLib.setenv('WL_STUB_HANG', '1', true);
+
+        let read;
+
+        try {
+            read = portal._wlPaste(['--type', 'image/png']);
+            await Utils.waitFor(() => hungPid() > 0);
+        } finally {
+            GLib.unsetenv('WL_STUB_HANG');
+        }
+
+        const pid = hungPid();
+        portal.destroy();
+        portal = null;
+
+        await expectAsync(read).toBeRejected();
+        await Utils.waitFor(() => !processExists(pid));
     });
 });
