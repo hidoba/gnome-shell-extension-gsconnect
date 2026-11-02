@@ -465,13 +465,13 @@ export const Channel = GObject.registerClass({
         const connection = await client.connect_async(address, cancellable);
 
         // Start the transfer
-        const transferredSize = await connection.output_stream.splice_async(
-            target, connection.input_stream,
+        const transferredSize = await target.splice_async(
+            connection.input_stream,
             (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
              Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
             GLib.PRIORITY_DEFAULT, cancellable);
 
-        if (transferredSize !== packet.payloadSize) {
+        if (transferredSize < packet.payloadSize) {
             throw new Gio.IOErrorEnum({
                 code: Gio.IOErrorEnum.PARTIAL_INPUT,
                 message: 'Transfer incomplete',
@@ -498,31 +498,41 @@ export const Channel = GObject.registerClass({
             }
         }
 
-        // Listen for the incoming connection
-        const acceptConnection = listener.accept_async(cancellable);
+        try {
+            // Listen for the incoming connection, which is no longer waited
+            // for once the listener is closed
+            const acceptConnection = listener.accept_async(cancellable);
 
-        // Notify the device we're ready
-        packet.body.payloadHash = this.checksum;
-        packet.payloadSize = size;
-        packet.payloadTransferInfo = {port: port};
-        const sendPacket = this.sendPacket(new Core.Packet(packet),
-            cancellable);
+            // Notify the device we're ready
+            packet.body.payloadHash = this.checksum;
+            packet.payloadSize = size;
+            packet.payloadTransferInfo = {port: port};
+            const sendPacket = this.sendPacket(new Core.Packet(packet),
+                cancellable);
 
-        // Accept the connection and configure the channel
-        const [, connection] = await Promise([sendPacket, acceptConnection]);
+            // Accept the connection and get the output
+            const [, [connection]] = await Promise.all([sendPacket,
+                acceptConnection]);
 
-        // Start the transfer
-        const transferredSize = await connection.output_stream.splice_async(
-            source,
-            (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
-             Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
-            GLib.PRIORITY_DEFAULT, cancellable);
+            // Start the transfer, and close the connection, since closing
+            // the output doesn't end it without TLS
+            const transferredSize = await connection.output_stream.splice_async(
+                source,
+                (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
+                 Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
+                GLib.PRIORITY_DEFAULT, cancellable);
+            connection.close(null);
 
-        if (transferredSize !== size) {
-            throw new Gio.IOErrorEnum({
-                code: Gio.IOErrorEnum.PARTIAL_INPUT,
-                message: 'Transfer incomplete',
-            });
+            if (transferredSize !== size) {
+                throw new Gio.IOErrorEnum({
+                    code: Gio.IOErrorEnum.PARTIAL_INPUT,
+                    message: 'Transfer incomplete',
+                });
+            }
+        } finally {
+            // Free the port for other transfers, even if the device didn't
+            // connect
+            listener.close();
         }
     }
 

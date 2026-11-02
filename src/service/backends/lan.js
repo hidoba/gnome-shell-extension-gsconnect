@@ -706,15 +706,31 @@ export const Channel = GObject.registerClass({
      * Authenticate a TLS connection.
      *
      * @param {Gio.TlsConnection} connection - A TLS connection
+     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer,
+     *   besides the channel
      * @returns {Promise} A promise for the operation
      */
-    async _authenticate(connection) {
+    async _authenticate(connection, cancellable = null) {
         // Standard TLS Handshake
         connection.validation_flags = Gio.TlsCertificateFlags.EXPIRED;
         connection.authentication_mode = Gio.TlsAuthenticationMode.REQUIRED;
 
-        await connection.handshake_async(GLib.PRIORITY_DEFAULT,
-            this.cancellable);
+        // The handshake is stopped with the channel, or with the transfer,
+        // since a device may never complete it
+        const handshakeCancellable = new Gio.Cancellable();
+        const handlers = [this.cancellable, cancellable]
+            .filter(source => source !== null)
+            .map(source => [source, source.connect(() => {
+                handshakeCancellable.cancel();
+            })]);
+
+        try {
+            await connection.handshake_async(GLib.PRIORITY_DEFAULT,
+                handshakeCancellable);
+        } finally {
+            for (const [source, id] of handlers)
+                source.disconnect(id);
+        }
 
         // Get a settings object for the device
         let settings;
@@ -778,25 +794,27 @@ export const Channel = GObject.registerClass({
      * Wrap the connection in Gio.TlsClientConnection and initiate handshake
      *
      * @param {Gio.TcpConnection} connection - The unauthenticated connection
+     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer
      * @returns {Gio.TlsClientConnection} The authenticated connection
      */
-    _encryptClient(connection) {
+    _encryptClient(connection, cancellable = null) {
         _configureSocket(connection);
 
         connection = Gio.TlsClientConnection.new(connection,
             connection.socket.remote_address);
         connection.set_certificate(this.certificate);
 
-        return this._authenticate(connection);
+        return this._authenticate(connection, cancellable);
     }
 
     /**
      * Wrap the connection in Gio.TlsServerConnection and initiate handshake
      *
      * @param {Gio.TcpConnection} connection - The unauthenticated connection
+     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer
      * @returns {Gio.TlsServerConnection} The authenticated connection
      */
-    _encryptServer(connection) {
+    _encryptServer(connection, cancellable = null) {
         _configureSocket(connection);
 
         connection = Gio.TlsServerConnection.new(connection, this.certificate);
@@ -807,7 +825,7 @@ export const Channel = GObject.registerClass({
             return true;
         });
 
-        return this._authenticate(connection);
+        return this._authenticate(connection, cancellable);
     }
 
     async _exchangeIdentities() {
@@ -943,7 +961,7 @@ export const Channel = GObject.registerClass({
 
         const client = new Gio.SocketClient({enable_proxy: false});
         const connection = await client.connect_async(address, cancellable)
-            .then(this._encryptClient.bind(this));
+            .then(conn => this._encryptClient(conn, cancellable));
 
         // Start the transfer
         const transferredSize = await target.splice_async(
@@ -988,11 +1006,17 @@ export const Channel = GObject.registerClass({
             }
         }
 
+        // The connection accepted from the device, if any
+        let accepted = null;
+
         try {
             // Listen for the incoming connection, which is no longer waited
             // for once the listener is closed
             const acceptConnection = listener.accept_async(cancellable)
-                .then(result => this._encryptServer(result[0]));
+                .then(result => {
+                    accepted = result[0];
+                    return this._encryptServer(accepted, cancellable);
+                });
 
             // Create an upload request
             packet.body.payloadHash = this.checksum;
@@ -1019,6 +1043,21 @@ export const Channel = GObject.registerClass({
                     message: 'Transfer incomplete',
                 });
             }
+        } catch (e) {
+            // A connection accepted for a request that failed isn't used.
+            // Its socket is shut down, since a handshake in progress keeps
+            // the connection from closing, and closing the socket alone
+            // doesn't stop it.
+            if (accepted !== null) {
+                try {
+                    accepted.socket.shutdown(true, true);
+                    accepted.socket.close();
+                } catch (e) {
+                    debug(e, this.device?.name);
+                }
+            }
+
+            throw e;
         } finally {
             // Free the port for other transfers, even if the device didn't
             // connect

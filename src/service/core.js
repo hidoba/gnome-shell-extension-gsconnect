@@ -583,17 +583,15 @@ export const Transfer = GObject.registerClass({
                 return;
 
             if (item.file instanceof Gio.File) {
-                const read = item.file.read_async(GLib.PRIORITY_DEFAULT,
-                    cancellable);
+                // The stream is kept first, so it's closed if this fails
+                item.source = await item.file.read_async(
+                    GLib.PRIORITY_DEFAULT, cancellable);
 
-                const query = item.file.query_info_async(
+                const info = await item.file.query_info_async(
                     Gio.FILE_ATTRIBUTE_STANDARD_SIZE,
                     Gio.FileQueryInfoFlags.NONE,
                     GLib.PRIORITY_DEFAULT,
                     cancellable);
-
-                const [stream, info] = await Promise.all([read, query]);
-                item.source = stream;
                 item.size = info.get_size();
             }
         }

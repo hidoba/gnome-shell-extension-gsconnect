@@ -44,14 +44,20 @@ function mockTransfer(source) {
 
 
 /**
- * Create a mock transfer, which doesn't complete until cancelled.
+ * Create a mock transfer, which receives part of a file and doesn't complete
+ * until cancelled.
  *
  * @returns {object} A mock transfer
  */
 function pendingTransfer() {
     return {
-        addFile() {},
+        addFile(packet, file) {
+            this.file = file;
+        },
         start(cancellable) {
+            this.file?.replace_contents('partial', null, false,
+                Gio.FileCreateFlags.NONE, null);
+
             return new Promise((resolve, reject) => {
                 this.cancel = jasmine.createSpy('cancel').and.callFake(() => {
                     reject(new Gio.IOErrorEnum({
@@ -410,6 +416,12 @@ describe('The clipboard plugin', function () {
 
         expect(packet.body.filename).toMatch(/^[0-9]+\.png$/);
         expect(packet.payloadSize).toBeGreaterThan(0);
+
+        // The device receives the same image
+        const {checksum} = await localPlugin._clipboard.getImage();
+        await Utils.waitFor(() => {
+            return remotePlugin._clipboard._image?.checksum === checksum;
+        });
     });
 
     it('does not push the same image twice', async function () {
@@ -417,12 +429,13 @@ describe('The clipboard plugin', function () {
             Utils.getDataPath('album.png'));
 
         spyOn(localPlugin, 'clipboardPush').and.callThrough();
+        spyOn(localPlugin.device, 'createTransfer').and.callThrough();
 
         // The re-encoded image has the same pixels
         await localPlugin._clipboard.setImage(new GLib.Bytes(contents));
 
         await localPlugin.clipboardPush.calls.mostRecent().returnValue;
-        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+        expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
     });
 
     it('pushes copied files', async function () {
@@ -431,6 +444,19 @@ describe('The clipboard plugin', function () {
         await remotePlugin.awaitPacket('kdeconnect.clipboard.file', {
             filename: 'vcard-valid.vcf',
         });
+
+        // The device receives the same file
+        await Utils.waitFor(() => {
+            const {type, uri} = remotePlugin._clipboard.content;
+
+            return type === 'file' && uri.endsWith('/vcard-valid.vcf');
+        });
+
+        const received = Gio.File.new_for_uri(remotePlugin._clipboard.content.uri);
+        const [, data] = received.load_contents(null);
+        const [, expected] = Utils.getDataFile('vcard-valid.vcf')
+            .load_contents(null);
+        expect(data).toEqual(expected);
     });
 
     it('pushes text after a file, even if unchanged', async function () {
@@ -607,6 +633,7 @@ describe('The clipboard plugin', function () {
         const received = remotePlugin._handleFile(filePacket('partial.bin'));
         await Promise.idle(GLib.PRIORITY_DEFAULT);
         const [path] = remotePlugin._receivingDirs;
+        expect(transfer.file.query_exists(null)).toBeTrue();
 
         cancellable.cancel();
         await received;

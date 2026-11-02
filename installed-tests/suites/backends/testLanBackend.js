@@ -32,6 +32,28 @@ function isPortFree(port) {
 }
 
 
+/**
+ * Wait for the other end of a connection to close it.
+ *
+ * @param {Gio.IOStream} connection - A connection
+ * @returns {Promise} A promise for the operation
+ */
+function waitForClose(connection) {
+    return new Promise(resolve => {
+        connection.input_stream.read_bytes_async(1, GLib.PRIORITY_DEFAULT,
+            null, (stream, res) => {
+                try {
+                    stream.read_bytes_finish(res);
+                } catch {
+                    // A reset connection is closed too
+                }
+
+                resolve();
+            });
+    });
+}
+
+
 describe('A LAN channel service', function () {
     let local, remote;
     let localChannel, remoteChannel;
@@ -190,6 +212,130 @@ describe('A LAN channel service', function () {
             spyOn(transfer, '_ensureStream').and.callFake(async (item, ...args) => {
                 await ensureStream(item, ...args);
                 source = item.source;
+            });
+
+            try {
+                await expectAsync(transfer.start()).toBeRejected();
+
+                expect(source).not.toBeNull();
+                await Utils.waitFor(() => source.is_closed());
+            } finally {
+                file.delete(null);
+            }
+        });
+
+        it('that stop a download the device does not encrypt', async function () {
+            // Like a device that connects, but never completes the handshake
+            const server = new Gio.SocketListener();
+            const port = server.add_any_inet_port(null);
+            let stalled = null;
+            server.accept_async(null).then(([connection]) => {
+                stalled = connection;
+            });
+
+            const packet = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {},
+                payloadSize: 1,
+                payloadTransferInfo: {port},
+            });
+            const cancellable = new Gio.Cancellable();
+
+            try {
+                const download = remoteChannel.download(packet,
+                    Gio.MemoryOutputStream.new_resizable(), cancellable);
+                await Utils.waitFor(() => stalled !== null);
+
+                cancellable.cancel();
+                await expectAsync(download).toBeRejected();
+            } finally {
+                stalled?.close(null);
+                server.close();
+            }
+        });
+
+        it('that stop an upload the device does not encrypt', async function () {
+            const cancellable = new Gio.Cancellable();
+            let stalled = null;
+
+            // Like a device that connects, but never completes the handshake
+            spyOn(localChannel, 'sendPacket').and.callFake(async request => {
+                const address = Gio.InetSocketAddress.new_from_string(
+                    '127.0.0.1', request.payloadTransferInfo.port);
+                const client = new Gio.SocketClient({enable_proxy: false});
+                stalled = await client.connect_async(address, null);
+            });
+
+            const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
+            const bytes = new GLib.Bytes('upload');
+
+            try {
+                const upload = localChannel.upload(packet,
+                    Gio.MemoryInputStream.new_from_bytes(bytes),
+                    bytes.get_size(), cancellable);
+                await Utils.waitFor(() => stalled !== null);
+
+                cancellable.cancel();
+                await expectAsync(upload).toBeRejected();
+                await waitForClose(stalled);
+            } finally {
+                stalled?.close(null);
+            }
+        });
+
+        it('that close a connection for an upload that was not requested', async function () {
+            let client = null;
+
+            // The device connects, but the request fails to send
+            spyOn(localChannel, 'sendPacket').and.callFake(async request => {
+                const address = Gio.InetSocketAddress.new_from_string(
+                    '127.0.0.1', request.payloadTransferInfo.port);
+                client = await new Gio.SocketClient({enable_proxy: false})
+                    .connect_async(address, null);
+
+                // Let the connection be accepted
+                await new Promise(resolve => {
+                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                        resolve();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                });
+
+                throw new Error('Request failed');
+            });
+
+            const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
+            const bytes = new GLib.Bytes('upload');
+
+            try {
+                await expectAsync(localChannel.upload(packet,
+                    Gio.MemoryInputStream.new_from_bytes(bytes),
+                    bytes.get_size())).toBeRejected();
+
+                await waitForClose(client);
+            } finally {
+                client?.close(null);
+            }
+        });
+
+        it('that close a file whose size can not be read', async function () {
+            const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
+            const [file, stream] = Gio.File.new_tmp('gsconnect.XXXXXX');
+            stream.close(null);
+            spyOn(file, 'query_info_async').and.rejectWith(
+                new Error('Query failed'));
+
+            const transfer = new Core.Transfer({channel: localChannel});
+            transfer.addFile(packet, file);
+
+            let source = null;
+            const ensureStream = transfer._ensureStream.bind(transfer);
+            spyOn(transfer, '_ensureStream').and.callFake(async (item, ...args) => {
+                try {
+                    await ensureStream(item, ...args);
+                } finally {
+                    source = item.source;
+                }
             });
 
             try {
