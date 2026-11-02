@@ -189,12 +189,21 @@ function watchPushes(plugin) {
 
 /**
  * Check that the clipboard content was not sent to the device, once it was
- * pushed.
+ * reported, which only pushes it if it's taken for a local copy.
  *
  * @param {object} plugin - A clipboard plugin watched with watchPushes()
  */
 async function expectNotSentBack(plugin) {
-    await Utils.waitFor(() => plugin.clipboardPush.calls.count() > 0);
+    await Utils.waitFor(() => plugin._pendingEchoes.length === 0 ||
+        plugin.clipboardPush.calls.count() > 0);
+
+    // Let an applied image be checked, which pushes it if it isn't the one
+    await new Promise(resolve => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
     await Promise.all(plugin.clipboardPush.calls.all()
         .map(call => call.returnValue));
 
@@ -957,6 +966,70 @@ describe('The clipboard plugin', function () {
         }
     });
 
+    it('recognizes many texts applied in quick succession', async function () {
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
+        remotePlugin._clipboard.async = true;
+
+        try {
+            // All are applied before the first is reported
+            for (let i = 0; i < 8; i++) {
+                remotePlugin.handlePacket(new Core.Packet({
+                    type: 'kdeconnect.clipboard',
+                    body: {content: `burst ${i}`},
+                }));
+            }
+
+            // None is sent back, although the device sent newer ones
+            await Utils.waitFor(() => remotePlugin._pendingEchoes.length === 0);
+            await Promise.idle(GLib.PRIORITY_DEFAULT);
+            expect(remotePlugin.clipboardPush).not.toHaveBeenCalled();
+            expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
+        } finally {
+            remotePlugin._clipboard.async = false;
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('stops expecting content that was never reported', function () {
+        const now = GLib.get_monotonic_time();
+        const spy = spyOn(GLib, 'get_monotonic_time').and.returnValue(now);
+        const unreported = {type: 'text', text: 'unreported'};
+        const later = {type: 'text', text: 'later'};
+
+        try {
+            remotePlugin._pendingEchoes = [];
+            remotePlugin._expectEcho(unreported);
+
+            // Content is applied again much later
+            spy.and.returnValue(now + 60 * 1000 * 1000);
+            remotePlugin._expectEcho(later);
+
+            expect(remotePlugin._pendingEchoes).toEqual([later]);
+        } finally {
+            remotePlugin._pendingEchoes = [];
+        }
+    });
+
+    it('only pulls images and files while they are shared', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        await remotePlugin._handleFile(filePacket('unshared.vcf'));
+        spyOn(remotePlugin._clipboard, 'setFile').and.callThrough();
+        const settings = remotePlugin._serviceSettings;
+
+        try {
+            settings.set_boolean('clipboard-files', false);
+            remotePlugin.clipboardPull();
+            expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
+        } finally {
+            settings.set_boolean('clipboard-files', true);
+        }
+
+        remotePlugin.clipboardPull();
+        expect(remotePlugin._clipboard.setFile).toHaveBeenCalled();
+    });
+
     it('stops expecting an image that could not be applied', async function () {
         const content = {
             type: 'image',
@@ -1369,7 +1442,9 @@ describe('The clipboard plugin', function () {
             await remotePlugin._checkAppliedImage.calls.mostRecent().returnValue;
             await Promise.idle(GLib.PRIORITY_DEFAULT);
 
-            expect(remotePlugin.clipboardPush).toHaveBeenCalledTimes(1);
+            // It couldn't be sent either
+            expect(remotePlugin._clipboard.getImage).toHaveBeenCalledTimes(1);
+            expect(remotePlugin.clipboardPush).not.toHaveBeenCalled();
         } finally {
             remotePlugin.settings.set_boolean('send-content', false);
         }

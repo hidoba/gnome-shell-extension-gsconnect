@@ -343,7 +343,8 @@ describe('A LAN channel service', function () {
         });
 
         it('that record an identity rebuilt before they send it', async function () {
-            // A connection that is never encrypted, so the channel stays open
+            // A device that never answers, so the channel is closed before
+            // it's encrypted
             const server = new Gio.SocketListener();
             const port = server.add_any_inet_port(null);
             const address = Gio.InetSocketAddress.new_from_string('127.0.0.1',

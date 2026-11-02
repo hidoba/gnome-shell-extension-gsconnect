@@ -86,9 +86,12 @@ function isSameContent(a, b) {
 
 /**
  * The maximum number of contents applied from a device, which are expected to
- * be reported as local clipboard changes.
+ * be reported as local clipboard changes, and the time in milliseconds they
+ * are expected for. A device may send many in quick succession, but content
+ * that was never reported mustn't be mistaken for a later copy of it.
  */
-const MAX_PENDING_ECHOES = 4;
+const MAX_PENDING_ECHOES = 32;
+const ECHO_TIMEOUT = 10000;
 
 
 /**
@@ -243,8 +246,9 @@ const ClipboardPlugin = GObject.registerClass({
         this._currentDir = null;
 
         // Contents applied from the device, which are yet to be reported as
-        // local clipboard changes, oldest first
+        // local clipboard changes, oldest first, and when each was applied
         this._pendingEchoes = [];
+        this._echoTimes = new WeakMap();
 
         // Serials, to ignore operations superseded by a clipboard change
         this._localSerial = 0;
@@ -636,10 +640,17 @@ const ClipboardPlugin = GObject.registerClass({
         // device, unless this is that content being applied
         const applied = this._getAppliedContent(content);
 
-        if (applied === null)
-            this._supersedeRemoteContent(content);
-        else if (applied.type === 'image')
-            this._checkAppliedImage(applied);
+        // Content applied from the device isn't sent back, even if the
+        // device has sent newer content since. An image is checked first,
+        // and pushed if it isn't the applied one.
+        if (applied !== null) {
+            if (applied.type === 'image')
+                this._checkAppliedImage(applied);
+
+            return;
+        }
+
+        this._supersedeRemoteContent(content);
 
         if (this.settings.get_boolean('send-content'))
             this.clipboardPush();
@@ -758,6 +769,13 @@ const ClipboardPlugin = GObject.registerClass({
      * @param {object} content - The content being applied
      */
     _expectEcho(content) {
+        // Content expected for too long was never reported
+        const now = GLib.get_monotonic_time();
+        this._pendingEchoes = this._pendingEchoes.filter(pending => {
+            return now - this._echoTimes.get(pending) < ECHO_TIMEOUT * 1000;
+        });
+
+        this._echoTimes.set(content, now);
         this._pendingEchoes.push(content);
 
         if (this._pendingEchoes.length > MAX_PENDING_ECHOES)
@@ -776,10 +794,12 @@ const ClipboardPlugin = GObject.registerClass({
         if (index === -1)
             return;
 
-        if (replacement !== null)
+        if (replacement !== null) {
+            this._echoTimes.set(replacement, this._echoTimes.get(content));
             this._pendingEchoes[index] = replacement;
-        else
+        } else {
             this._pendingEchoes.splice(index, 1);
+        }
     }
 
     /*
@@ -1104,6 +1124,11 @@ const ClipboardPlugin = GObject.registerClass({
         const content = this._remoteContent;
 
         if (content === null)
+            return;
+
+        // Images and files are only applied while they're shared
+        if (content.type !== 'text' &&
+            !this._serviceSettings.get_boolean('clipboard-files'))
             return;
 
         // The content is recorded before it is applied, so the resulting
