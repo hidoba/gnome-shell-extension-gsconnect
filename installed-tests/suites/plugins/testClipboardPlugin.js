@@ -303,6 +303,10 @@ describe('The clipboard plugin', function () {
 
             // Transfers are faked, so there is nothing to reject
             spyOn(remotePlugin.device, 'rejectTransfer');
+
+            // Content expected to be reported by one test isn't by another
+            localPlugin._pendingEchoes = [];
+            remotePlugin._pendingEchoes = [];
         }
     });
 
@@ -1009,6 +1013,49 @@ describe('The clipboard plugin', function () {
         } finally {
             remotePlugin._pendingEchoes = [];
         }
+    });
+
+    it('recognizes texts reported once for several applied', async function () {
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            for (const text of ['merged A', 'merged B', 'merged A']) {
+                remotePlugin._expectEcho({type: 'text', text});
+                remotePlugin._remoteContent = {type: 'text', text};
+                remotePlugin._pulledContent = remotePlugin._remoteContent;
+            }
+
+            // The clipboard reports what it holds now
+            remotePlugin._clipboard._setContent({type: 'text', text: 'merged A'});
+            expect(remotePlugin._pendingEchoes).toEqual([]);
+
+            // Copying an earlier one again is sent
+            remotePlugin._clipboard._setContent({type: 'text', text: 'merged B'});
+            await remotePlugin.clipboardPush.calls.mostRecent().returnValue;
+            expect(remotePlugin.device.sendPacket).toHaveBeenCalledWith(
+                jasmine.objectContaining({body: {content: 'merged B'}}));
+        } finally {
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('does not recognize content expected for too long', function () {
+        const now = GLib.get_monotonic_time();
+        const spy = spyOn(GLib, 'get_monotonic_time').and.returnValue(now);
+        const content = {type: 'text', text: 'never reported'};
+
+        remotePlugin._expectEcho(content);
+        spy.and.returnValue(now + 60 * 1000 * 1000);
+
+        expect(remotePlugin._getAppliedContent({...content})).toBeNull();
+    });
+
+    it('forgets content expected before reconnecting', function () {
+        remotePlugin._expectEcho({type: 'text', text: 'before reconnecting'});
+        remotePlugin.connected();
+
+        expect(remotePlugin._pendingEchoes).toEqual([]);
     });
 
     it('only pulls images and files while they are shared', async function () {

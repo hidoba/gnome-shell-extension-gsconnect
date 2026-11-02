@@ -258,9 +258,11 @@ const ClipboardPlugin = GObject.registerClass({
     connected() {
         super.connected();
 
-        // The remote clipboard may have changed while disconnected
+        // The remote clipboard may have changed while disconnected, and
+        // content applied before won't be reported now
         this._remoteContent = null;
         this._pulledContent = null;
+        this._pendingEchoes = [];
 
         // TODO: if we're not auto-syncing local->remote, but we are doing the
         //       reverse, it's possible older remote content will end up
@@ -744,13 +746,17 @@ const ClipboardPlugin = GObject.registerClass({
      *   the change is a local copy
      */
     _getAppliedContent(content) {
+        this._dropExpiredEchoes();
+
         // Images are not read just to compare them, so the first image after
-        // applying one is assumed to be it
-        const index = this._pendingEchoes.findIndex(pending => {
-            return content.type === 'image'
-                ? pending.type === 'image'
-                : isSameContent(content, pending);
-        });
+        // applying one is assumed to be it, and checked. Other content may be
+        // reported once for several applied in quick succession, so the last
+        // that matches is taken, which is what the clipboard holds now.
+        const index = content.type === 'image'
+            ? this._pendingEchoes.findIndex(pending => pending.type === 'image')
+            : this._pendingEchoes.findLastIndex(pending => {
+                return isSameContent(content, pending);
+            });
 
         // Applied content is only reported once, so copying the same content
         // again is a new change. Content applied before it may not be
@@ -769,17 +775,23 @@ const ClipboardPlugin = GObject.registerClass({
      * @param {object} content - The content being applied
      */
     _expectEcho(content) {
-        // Content expected for too long was never reported
-        const now = GLib.get_monotonic_time();
-        this._pendingEchoes = this._pendingEchoes.filter(pending => {
-            return now - this._echoTimes.get(pending) < ECHO_TIMEOUT * 1000;
-        });
-
-        this._echoTimes.set(content, now);
+        this._dropExpiredEchoes();
+        this._echoTimes.set(content, GLib.get_monotonic_time());
         this._pendingEchoes.push(content);
 
         if (this._pendingEchoes.length > MAX_PENDING_ECHOES)
             this._pendingEchoes.shift();
+    }
+
+    /**
+     * Stop expecting content expected for too long, which was never reported.
+     */
+    _dropExpiredEchoes() {
+        const now = GLib.get_monotonic_time();
+
+        this._pendingEchoes = this._pendingEchoes.filter(pending => {
+            return now - this._echoTimes.get(pending) < ECHO_TIMEOUT * 1000;
+        });
     }
 
     /**
