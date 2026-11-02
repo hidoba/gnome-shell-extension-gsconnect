@@ -56,17 +56,17 @@ case "$1" in
         echo
         ;;
     *)
-        if [ -n "$WL_STUB_HANG" ]; then
-            # Like an application that doesn't send the clipboard
-            echo $$ > "$WL_STUB_DIR/hung"
-            exec sleep 60
-        fi
-
         type=
         while [ $# -gt 0 ]; do
             [ "$1" = --type ] && { type=$2; shift; }
             shift
         done
+
+        if [ "$type" = "$WL_STUB_HANG_TYPE" ]; then
+            # Like an application that doesn't send the clipboard
+            echo $$ > "$WL_STUB_DIR/hung"
+            exec sleep 60
+        fi
         [ -e "$current" ] || exit 1
         [ "$type" = "$(cat "$current/type")" ] || exit 1
         cat "$current/data"
@@ -80,6 +80,12 @@ esac
  * clipboard of GNOME Shell or of a running service, which would change the
  * clipboard of the desktop
  */
+/*
+ * A type only read by the tests, which the stand-in for wl-paste doesn't send
+ * if set as WL_STUB_HANG_TYPE, unlike the types read by the clipboard
+ */
+const HANG_TYPE = 'application/x-gsconnect-test';
+
 const PORTAL_NAME = 'org.gnome.Shell.Extensions.GSConnect.Clipboard';
 const [portalRunning] = Gio.DBus.session.call_sync('org.freedesktop.DBus',
     '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'NameHasOwner',
@@ -238,7 +244,7 @@ function processExists(pid) {
         globalThis.HAVE_GNOME = haveGnome;
         GLib.setenv('PATH', path, true);
         GLib.unsetenv('WL_STUB_DIR');
-        GLib.unsetenv('WL_STUB_HANG');
+        GLib.unsetenv('WL_STUB_HANG_TYPE');
         Utils.removeDirectory(tmpdir);
     });
 
@@ -340,35 +346,38 @@ function processExists(pid) {
 
     it('stops reading a clipboard that is not sent', async function () {
         GLib.unlink(`${stubDir}/hung`);
-        GLib.setenv('WL_STUB_HANG', '1', true);
+        GLib.setenv('WL_STUB_HANG_TYPE', HANG_TYPE, true);
         portal._pasteTimeout = 200;
 
         try {
-            await expectAsync(getValue(clipboard._clipboard, 'image/png'))
-                .toBeRejected();
+            await getValue(clipboard._clipboard, HANG_TYPE);
+            fail('The value was read');
+        } catch (e) {
+            expect(e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.TIMED_OUT))
+                .withContext(e.message).toBeTrue();
         } finally {
-            GLib.unsetenv('WL_STUB_HANG');
+            GLib.unsetenv('WL_STUB_HANG_TYPE');
             portal._pasteTimeout = 20000;
         }
 
         const pid = hungPid();
         expect(pid).toBeGreaterThan(0);
         await Utils.waitFor(() => !processExists(pid));
-        expect(portal._pastes.size).toBe(0);
+        await Utils.waitFor(() => portal._pastes.size === 0);
     });
 
     // This must be the last test, since it destroys the portal
     it('stops reading the clipboard when destroyed', async function () {
         GLib.unlink(`${stubDir}/hung`);
-        GLib.setenv('WL_STUB_HANG', '1', true);
+        GLib.setenv('WL_STUB_HANG_TYPE', HANG_TYPE, true);
 
         let read;
 
         try {
-            read = portal._wlPaste(['--type', 'image/png']);
+            read = portal._wlPaste(['--type', HANG_TYPE]);
             await Utils.waitFor(() => hungPid() > 0);
         } finally {
-            GLib.unsetenv('WL_STUB_HANG');
+            GLib.unsetenv('WL_STUB_HANG_TYPE');
         }
 
         const pid = hungPid();

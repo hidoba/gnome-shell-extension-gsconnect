@@ -124,6 +124,37 @@ describe('A LAN channel service', function () {
 
             expect(receivedBytes.equal(sentBytes)).toBeTrue();
         });
+
+        it('that close a file whose download failed', async function () {
+            // Nothing is listening on the port of the payload
+            const packet = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {},
+                payloadSize: 1,
+                payloadTransferInfo: {port: 9},
+            });
+            const [file, stream] = Gio.File.new_tmp('gsconnect.XXXXXX');
+            stream.close(null);
+
+            const transfer = new Core.Transfer({channel: remoteChannel});
+            transfer.addFile(packet, file);
+
+            let target = null;
+            const ensureStream = transfer._ensureStream.bind(transfer);
+            spyOn(transfer, '_ensureStream').and.callFake(async (item, ...args) => {
+                await ensureStream(item, ...args);
+                target = item.target;
+            });
+
+            try {
+                await expectAsync(transfer.start()).toBeRejected();
+
+                expect(target).not.toBeNull();
+                await Utils.waitFor(() => target.is_closed());
+            } finally {
+                file.delete(null);
+            }
+        });
     });
 
     it('can be stopped', function () {

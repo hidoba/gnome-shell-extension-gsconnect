@@ -666,10 +666,9 @@ export const Transfer = GObject.registerClass({
     async start(cancellable = null) {
         let error = null;
         let cancelledId = 0;
+        let item;
 
         try {
-            let item;
-
             // If a cancellable is passed in, chain to its signal
             if (cancellable instanceof Gio.Cancellable)
                 cancelledId = cancellable.connect(() => this._cancellable.cancel());
@@ -700,6 +699,13 @@ export const Transfer = GObject.registerClass({
             }
         } catch (e) {
             error = e;
+
+            // A stream opened for a file is only closed once transferred
+            if (item?.file instanceof Gio.File) {
+                const stream = item.packet.hasPayload() ? item.target
+                    : item.source;
+                stream?.close_async(GLib.PRIORITY_DEFAULT, null, null);
+            }
         } finally {
             if (cancelledId > 0)
                 cancellable.disconnect(cancelledId);
