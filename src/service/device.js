@@ -336,12 +336,24 @@ const Device = GObject.registerClass({
             return;
 
         // Packets waiting to be written to a replaced channel are written to
-        // the new one, first, and are dropped with it if disconnected
-        let unsent = [];
+        // the new one, first, and are dropped with it if disconnected. Those
+        // requesting a transfer are dropped too, since the transfer belongs to
+        // the replaced channel.
+        const unsent = [];
 
         if (this.channel !== null) {
-            if (channel !== null)
-                unsent = this.channel.takeUnsentPackets();
+            if (channel !== null) {
+                for (const item of this.channel.takeUnsentPackets()) {
+                    if (item.packet.hasPayload?.()) {
+                        item.reject(new Gio.IOErrorEnum({
+                            code: Gio.IOErrorEnum.CONNECTION_CLOSED,
+                            message: 'Channel replaced',
+                        }));
+                    } else {
+                        unsent.push(item);
+                    }
+                }
+            }
 
             this.channel.close();
         }
@@ -369,7 +381,7 @@ const Device = GObject.registerClass({
         try {
             let packet = null;
 
-            while ((packet = await this.channel.readPacket())) {
+            while ((packet = await channel.readPacket())) {
                 debug(packet, this.name);
                 this.handlePacket(packet);
             }

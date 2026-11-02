@@ -75,6 +75,27 @@ function pendingTransfer() {
 
 
 /**
+ * Set whether images and files are shared, and tell the devices of plugins, as
+ * they are when they reconnect.
+ *
+ * @param {boolean} enabled - Whether images and files are shared
+ * @param {...object} plugins - Clipboard plugins
+ */
+function shareFiles(enabled, ...plugins) {
+    plugins[0]._serviceSettings.set_boolean('clipboard-files', enabled);
+
+    for (const plugin of plugins) {
+        // Like a channel connected since, with the identity rebuilt. The
+        // mock backend's own identity has no capabilities.
+        const channel = plugin.device.channel;
+        const {backend} = channel;
+        Core.ChannelService.prototype.buildIdentity.call(backend);
+        channel.backend = backend;
+    }
+}
+
+
+/**
  * List the names of the children of a directory.
  *
  * @param {Gio.File} dir - A directory
@@ -398,10 +419,8 @@ describe('The clipboard plugin', function () {
     });
 
     it('pushes images as PNG files', async function () {
-        // The setting is shared by both plugins, and applies to sending once
-        // the device reconnects
-        localPlugin._serviceSettings.set_boolean('clipboard-files', true);
-        localPlugin.connected();
+        // The setting is shared by both plugins
+        shareFiles(true, localPlugin, remotePlugin);
         localPlugin._clipboard.text = 'reset';
         await remotePlugin.awaitPacket('kdeconnect.clipboard', {
             content: 'reset',
@@ -1604,19 +1623,15 @@ describe('The clipboard plugin', function () {
         expect(transfer.cancel).toHaveBeenCalled();
     });
 
-    it('only sends files once reconnected after sharing them is enabled', function () {
-        const settings = localPlugin._serviceSettings;
-
+    it('only sends files once the device is told they are shared', function () {
         try {
-            settings.set_boolean('clipboard-files', false);
-            localPlugin.connected();
+            shareFiles(false, localPlugin);
 
             // The device wasn't told files are sent when it connected
-            settings.set_boolean('clipboard-files', true);
+            localPlugin._serviceSettings.set_boolean('clipboard-files', true);
             expect(localPlugin._canSendFiles()).toBeFalse();
         } finally {
-            settings.set_boolean('clipboard-files', true);
-            localPlugin.connected();
+            shareFiles(true, localPlugin);
         }
 
         expect(localPlugin._canSendFiles()).toBeTrue();

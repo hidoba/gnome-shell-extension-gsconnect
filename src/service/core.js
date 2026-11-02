@@ -153,6 +153,10 @@ export const Channel = GObject.registerClass({
 
     set backend(backend) {
         this._backend = backend;
+
+        // The identity the device is told about when connecting, which is
+        // rebuilt for later channels when the service's capabilities change
+        this._localIdentity = backend?.identity ?? null;
     }
 
     get cancellable() {
@@ -160,6 +164,15 @@ export const Channel = GObject.registerClass({
             this._cancellable = new Gio.Cancellable();
 
         return this._cancellable;
+    }
+
+    /**
+     * The identity sent to the device for this channel, if known.
+     *
+     * @type {Packet|null}
+     */
+    get localIdentity() {
+        return this._localIdentity ?? null;
     }
 
     get closed() {

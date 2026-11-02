@@ -14,7 +14,8 @@ const {default: Device} = await import(`file://${Config.PACKAGE_DATADIR}/service
 
 /*
  * A channel that records the types of the packets it writes, or doesn't
- * finish writing them until closed if blocked
+ * finish writing them until closed if blocked, and reads packets passed to
+ * receive()
  */
 const TestChannel = GObject.registerClass({
     GTypeName: 'GSConnectTestDeviceChannel',
@@ -45,7 +46,9 @@ const TestChannel = GObject.registerClass({
     }
 
     readPacket() {
-        return new Promise(() => {});
+        this.reads = (this.reads ?? 0) + 1;
+
+        return new Promise(resolve => (this.receive = resolve));
     }
 
     close() {
@@ -231,14 +234,37 @@ describe('A device whose channel is replaced', function () {
         device.sendPacket({type: 'kdeconnect.stuck', body: {}});
         device.sendPacket({type: 'kdeconnect.waiting', body: {}});
 
+        // The request of a transfer belongs to the replaced channel
+        const request = device.channel.sendPacket(new Core.Packet({
+            type: 'kdeconnect.request',
+            body: {},
+            payloadSize: 1,
+            payloadTransferInfo: {port: 1739},
+        }));
+
         const replacement = new TestChannel(identity);
         device.setChannel(replacement);
         device.sendPacket({type: 'kdeconnect.later', body: {}});
 
+        await expectAsync(request).toBeRejected();
         await Utils.waitFor(() => replacement.written.length === 2);
         expect(replacement.written).toEqual([
             'kdeconnect.waiting',
             'kdeconnect.later',
         ]);
+    });
+
+    it('only reads from the new channel once', async function () {
+        const replaced = new TestChannel(identity);
+        device.setChannel(replaced);
+
+        const replacement = new TestChannel(identity);
+        device.setChannel(replacement);
+
+        // A packet read from the replaced channel as it's replaced
+        replaced.receive(new Core.Packet({type: 'kdeconnect.late', body: {}}));
+        await Promise.idle();
+
+        expect(replacement.reads).toBe(1);
     });
 });

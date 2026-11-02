@@ -208,8 +208,6 @@ const ClipboardPlugin = GObject.registerClass({
         this._serviceSettings = new Gio.Settings({
             settings_schema: Config.GSCHEMA.lookup(Config.APP_ID, true),
         });
-        this._filesAdvertised = this._serviceSettings.get_boolean(
-            'clipboard-files');
         this._filesChangedId = this._serviceSettings.connect(
             'changed::clipboard-files', this._onFilesChanged.bind(this));
 
@@ -255,9 +253,6 @@ const ClipboardPlugin = GObject.registerClass({
 
     connected() {
         super.connected();
-
-        this._filesAdvertised = this._serviceSettings.get_boolean(
-            'clipboard-files');
 
         // The remote clipboard may have changed while disconnected
         this._remoteContent = null;
@@ -834,11 +829,18 @@ const ClipboardPlugin = GObject.registerClass({
      * @returns {boolean} %true if supported
      */
     _canSendFiles() {
-        if (!this._filesAdvertised ||
-            !this._serviceSettings.get_boolean('clipboard-files'))
+        if (!this._serviceSettings.get_boolean('clipboard-files'))
             return false;
 
         if (!this.device.connected)
+            return false;
+
+        // The device must have been told that files are sent, which it is
+        // when it connects
+        const advertised = this.device.channel?.localIdentity?.body
+            .outgoingCapabilities ?? [];
+
+        if (!advertised.includes('kdeconnect.clipboard.file'))
             return false;
 
         const incoming = this.device.settings.get_strv('incoming-capabilities');
