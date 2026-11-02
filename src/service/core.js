@@ -700,11 +700,12 @@ export const Transfer = GObject.registerClass({
         } catch (e) {
             error = e;
 
-            // A stream opened for a file is only closed once transferred
+            // A stream opened for a file is only closed once transferred.
+            // Only one of them is opened, and the packet can't tell which,
+            // since uploading adds the payload to it.
             if (item?.file instanceof Gio.File) {
-                const stream = item.packet.hasPayload() ? item.target
-                    : item.source;
-                stream?.close_async(GLib.PRIORITY_DEFAULT, null, null);
+                item.source?.close_async(GLib.PRIORITY_DEFAULT, null, null);
+                item.target?.close_async(GLib.PRIORITY_DEFAULT, null, null);
             }
         } finally {
             if (cancelledId > 0)

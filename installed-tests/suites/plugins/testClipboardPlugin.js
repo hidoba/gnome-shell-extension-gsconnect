@@ -599,18 +599,19 @@ describe('The clipboard plugin', function () {
         const transfer = pendingTransfer();
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
 
+        // The plugin isn't destroyed, since later tests use it, but its
+        // operations are cancelled the same way
+        const cancellable = new Gio.Cancellable();
+        spyOnProperty(remotePlugin, 'cancellable').and.returnValue(cancellable);
+
         const received = remotePlugin._handleFile(filePacket('partial.bin'));
         await Promise.idle(GLib.PRIORITY_DEFAULT);
         const [path] = remotePlugin._receivingDirs;
 
-        // Destroying the plugin cancels its operations
-        const cancellable = new Gio.Cancellable();
         cancellable.cancel();
-        spyOnProperty(remotePlugin, 'cancellable').and.returnValue(cancellable);
-
-        transfer.cancel();
         await received;
 
+        expect(transfer.cancel).toHaveBeenCalled();
         expect(Gio.File.new_for_path(path).query_exists(null)).toBeFalse();
     });
 

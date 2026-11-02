@@ -988,33 +988,41 @@ export const Channel = GObject.registerClass({
             }
         }
 
-        // Listen for the incoming connection
-        const acceptConnection = listener.accept_async(cancellable)
-            .then(result => this._encryptServer(result[0]));
+        try {
+            // Listen for the incoming connection, which is no longer waited
+            // for once the listener is closed
+            const acceptConnection = listener.accept_async(cancellable)
+                .then(result => this._encryptServer(result[0]));
 
-        // Create an upload request
-        packet.body.payloadHash = this.checksum;
-        packet.payloadSize = size;
-        packet.payloadTransferInfo = {port: port};
-        const requestUpload = this.sendPacket(new Core.Packet(packet),
-            cancellable);
+            // Create an upload request
+            packet.body.payloadHash = this.checksum;
+            packet.payloadSize = size;
+            packet.payloadTransferInfo = {port: port};
+            const requestUpload = this.sendPacket(new Core.Packet(packet),
+                cancellable);
 
-        // Request an upload stream, accept the connection and get the output
-        const [, connection] = await Promise.all([requestUpload,
-            acceptConnection]);
+            // Request an upload stream, accept the connection and get the
+            // output
+            const [, connection] = await Promise.all([requestUpload,
+                acceptConnection]);
 
-        // Start the transfer
-        const transferredSize = await connection.output_stream.splice_async(
-            source,
-            (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
-             Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
-            GLib.PRIORITY_DEFAULT, cancellable);
+            // Start the transfer
+            const transferredSize = await connection.output_stream.splice_async(
+                source,
+                (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
+                 Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
+                GLib.PRIORITY_DEFAULT, cancellable);
 
-        if (transferredSize !== size) {
-            throw new Gio.IOErrorEnum({
-                code: Gio.IOErrorEnum.PARTIAL_INPUT,
-                message: 'Transfer incomplete',
-            });
+            if (transferredSize !== size) {
+                throw new Gio.IOErrorEnum({
+                    code: Gio.IOErrorEnum.PARTIAL_INPUT,
+                    message: 'Transfer incomplete',
+                });
+            }
+        } finally {
+            // Free the port for other transfers, even if the device didn't
+            // connect
+            listener.close();
         }
     }
 
