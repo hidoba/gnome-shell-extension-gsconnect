@@ -265,6 +265,9 @@ describe('The clipboard plugin', function () {
         if (remotePlugin && localPlugin) {
             spyOn(remotePlugin, 'handlePacket').and.callThrough();
             spyOn(localPlugin.device, 'sendPacket').and.callThrough();
+
+            // Transfers are faked, so there is nothing to reject
+            spyOn(remotePlugin.device, 'rejectTransfer');
         }
     });
 
@@ -381,7 +384,6 @@ describe('The clipboard plugin', function () {
 
     it('rejects files when sharing them is disabled', async function () {
         spyOn(remotePlugin.device, 'createTransfer');
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         await remotePlugin._handleFile(filePacket('album.png'));
 
@@ -557,6 +559,24 @@ describe('The clipboard plugin', function () {
         expect(transfer.cancel).toHaveBeenCalled();
         expect(remotePlugin._clipboard.setFile).not.toHaveBeenCalled();
         expect(remotePlugin._clipboard.text).toBe('newer');
+    });
+
+    it('rejects a file superseded before it was received', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        const packet = filePacket('superseded.bin');
+
+        const received = remotePlugin._handleFile(packet);
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        remotePlugin.handlePacket(new Core.Packet({
+            type: 'kdeconnect.clipboard',
+            body: {content: 'superseding'},
+        }));
+        await received;
+
+        // The device may still be waiting to send it
+        expect(remotePlugin.device.rejectTransfer).toHaveBeenCalledWith(packet);
     });
 
     it('cancels receiving a file superseded by a local copy', async function () {
@@ -754,7 +774,6 @@ describe('The clipboard plugin', function () {
 
     it('rejects a file that can\'t be received', async function () {
         spyOn(remotePlugin.device, 'createTransfer').and.throwError('Failed');
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         await remotePlugin._handleFile(filePacket('failed.bin'));
 
@@ -763,7 +782,6 @@ describe('The clipboard plugin', function () {
 
     it('rejects a file without a name', async function () {
         spyOn(remotePlugin.device, 'createTransfer');
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         await remotePlugin._handleFile(filePacket(null));
 
@@ -1100,7 +1118,6 @@ describe('The clipboard plugin', function () {
 
     it('rejects files that are too large', async function () {
         spyOn(remotePlugin.device, 'createTransfer');
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         await remotePlugin._handleFile(filePacket('big.bin', 100 * 1024 * 1024));
 
@@ -1111,7 +1128,6 @@ describe('The clipboard plugin', function () {
     it('rejects files when not allowed to pull content', async function () {
         remotePlugin.settings.set_boolean('receive-content', false);
         spyOn(remotePlugin.device, 'createTransfer');
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         await remotePlugin._handleFile(filePacket('album.png'));
 
@@ -1336,6 +1352,9 @@ describe('The clipboard plugin', function () {
         expect(remotePlugin._clipboard.setImage).not.toHaveBeenCalled();
         expect(remotePlugin._currentDir).toBe(dir);
         expect(transfer.file.query_exists(null)).toBeFalse();
+
+        // The file was received, so the transfer is over
+        expect(remotePlugin.device.rejectTransfer).not.toHaveBeenCalled();
     });
 
     it('pushes a copied file again once it changed', async function () {
@@ -1499,7 +1518,6 @@ describe('The clipboard plugin', function () {
         const existing = remotePlugin._getReceiveDirectory().get_child(
             `${now}-${remotePlugin._remoteSerial + 1}`);
         existing.make_directory(null);
-        spyOn(remotePlugin.device, 'rejectTransfer');
 
         remotePlugin._serviceSettings.set_boolean('clipboard-files', true);
         remotePlugin.settings.set_boolean('receive-content', true);

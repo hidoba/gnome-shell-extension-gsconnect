@@ -385,6 +385,9 @@ describe('The Clipboard component with a clipboard portal', function () {
 
         expect(clipboard._setImage).toBeNull();
         expect(clipboard._image).toBeNull();
+
+        // The proxy isn't connected, so later tests must not call it
+        clipboard._clipboard = null;
     });
 
     it('drops an image read when the clipboard changes meanwhile', async function () {

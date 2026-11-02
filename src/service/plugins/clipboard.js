@@ -441,7 +441,7 @@ const ClipboardPlugin = GObject.registerClass({
         }
 
         let dir = null;
-        let started = false;
+        let received = false;
 
         // Cancelled when superseded, or when the plugin is destroyed
         const cancellable = new Gio.Cancellable();
@@ -467,7 +467,6 @@ const ClipboardPlugin = GObject.registerClass({
             transfer.addFile(packet, file);
 
             this._incomingTransfer = transfer;
-            started = true;
 
             // Devices may send more than the size they declared, so the file
             // is checked while it is received and once it is complete
@@ -494,6 +493,8 @@ const ClipboardPlugin = GObject.registerClass({
                     this._incomingTransfer = null;
             }
 
+            received = true;
+
             if (getFileSize(file) > MAX_FILE_SIZE)
                 throw new Error('Clipboard file exceeded its size');
 
@@ -515,8 +516,10 @@ const ClipboardPlugin = GObject.registerClass({
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.device.name);
 
-            // Don't leave the device waiting to send the file
-            if (!started)
+            // Don't leave the device waiting to send the file, which may not
+            // have been downloaded at all if the transfer was cancelled
+            // before connecting
+            if (!received)
                 this.device.rejectTransfer(packet);
 
             if (dir !== null && dir !== this._currentDir)

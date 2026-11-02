@@ -67,12 +67,23 @@ const TEXT_MIMETYPES = [
 export const Clipboard = GObject.registerClass(
     {
         GTypeName: 'GSConnectShellClipboard',
+        Signals: {
+            'OwnerChange': {},
+        },
     },
     class GSConnectShellClipboard extends GObject.Object {
         _init() {
             super._init();
 
             this._transferring = false;
+
+            // The value waiting to be copied, while another one is copied
+            this._nextCopy = null;
+            this._copying = false;
+
+            // Prepare DBus interface, before starting the watcher, which
+            // would be left running if this failed
+            this._dbus = DBus.wrapObject(DBUS_INFO, this);
 
             this.watcher = Gio.Subprocess.new([
                 'wl-paste',
@@ -82,9 +93,6 @@ export const Clipboard = GObject.registerClass(
                 '--dest=' + DBUS_NAME,
                 DBUS_NAME + '.OwnerChange',
             ], Gio.SubprocessFlags.NONE);
-
-            // Prepare DBus interface
-            this._dbus = DBus.wrapObject(DBUS_INFO, this);
 
             this._nameId = Gio.DBus.own_name(
                 Gio.BusType.SESSION,
@@ -218,13 +226,49 @@ export const Clipboard = GObject.registerClass(
         }
 
         /**
-         * Run wl-copy with {@link value} as input.
+         * Copy {@link value} to the clipboard.
+         *
+         * Values are copied one at a time, so the last value set is the one
+         * kept, and values set while another is copied are only copied if
+         * they weren't superseded.
          *
          * @param {Uint8Array} value - The value to copy
          * @param {string} [mimetype] - The mimetype of the value, inferred by
          *   wl-copy if not given
          */
-        _wlCopy(value, mimetype = null) {
+        async _wlCopy(value, mimetype = null) {
+            this._nextCopy = {value, mimetype};
+
+            if (this._copying)
+                return;
+
+            this._copying = true;
+
+            try {
+                while (this._nextCopy !== null) {
+                    const next = this._nextCopy;
+                    this._nextCopy = null;
+
+                    try {
+                        await this._runWlCopy(next.value, next.mimetype);
+                    } catch (e) {
+                        logError(e);
+                    }
+                }
+            } finally {
+                this._copying = false;
+            }
+        }
+
+        /**
+         * Run wl-copy with {@link value} as input.
+         *
+         * @param {Uint8Array} value - The value to copy
+         * @param {string} [mimetype] - The mimetype of the value, inferred by
+         *   wl-copy if not given
+         * @returns {Promise<void>} Resolved once wl-copy took the clipboard
+         */
+        _runWlCopy(value, mimetype = null) {
             const argv = ['wl-copy'];
 
             if (mimetype !== null)
@@ -237,12 +281,16 @@ export const Clipboard = GObject.registerClass(
                 Gio.SubprocessFlags.STDOUT_SILENCE |
                 Gio.SubprocessFlags.STDERR_SILENCE);
 
-            proc.communicate_async(new GLib.Bytes(value), null, (proc, res) => {
-                try {
-                    proc.communicate_finish(res);
-                } catch (e) {
-                    logError(e);
-                }
+            return new Promise((resolve, reject) => {
+                proc.communicate_async(new GLib.Bytes(value), null,
+                    (proc_, res) => {
+                        try {
+                            proc_.communicate_finish(res);
+                            resolve();
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
             });
         }
 
@@ -334,6 +382,8 @@ export const Clipboard = GObject.registerClass(
         }
 
         destroy() {
+            this._nextCopy = null;
+
             if (this._nameId > 0) {
                 Gio.bus_unown_name(this._nameId);
                 this._nameId = 0;
