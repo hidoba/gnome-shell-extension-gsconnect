@@ -98,8 +98,6 @@ const Device = GObject.registerClass({
         this._procs = new Set();
         this._transfers = new Map();
 
-        this._outputLock = false;
-        this._outputQueue = [];
 
         // GSettings
         this.settings = new Gio.Settings({
@@ -342,11 +340,9 @@ const Device = GObject.registerClass({
 
         this._channel = channel;
 
-        // If we've disconnected empty the queue, otherwise restart the read
-        // loop and update the device metadata
-        if (this.channel === null) {
-            this._outputQueue.length = 0;
-        } else {
+        // Packets waiting to be written are dropped with the old channel.
+        // Otherwise restart the read loop and update the device metadata.
+        if (this.channel !== null) {
             this._handleIdentity(this.channel.identity);
             this._readLoop(channel);
         }
@@ -464,25 +460,14 @@ const Device = GObject.registerClass({
             if (!this.paired && packet.type !== 'kdeconnect.pair')
                 return;
 
-            this._outputQueue.push(new Core.Packet(packet));
-
-            if (this._outputLock)
-                return;
-
-            this._outputLock = true;
-            let next;
-
-            while ((next = this._outputQueue.shift())) {
-                await this.channel.sendPacket(next);
-                debug(next, this.name);
-            }
-
-            this._outputLock = false;
+            // The channel writes packets one at a time, in the order they
+            // are sent, including those it sends itself
+            const next = new Core.Packet(packet);
+            await this.channel.sendPacket(next);
+            debug(next, this.name);
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.name);
-
-            this._outputLock = false;
         }
     }
 
@@ -932,7 +917,7 @@ const Device = GObject.registerClass({
             this._procs.clear();
 
             for (const transfer of this._transfers.values())
-                transfer.close();
+                transfer.cancel();
 
             this._transfers.clear();
         }

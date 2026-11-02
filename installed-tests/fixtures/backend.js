@@ -502,15 +502,20 @@ export const Channel = GObject.registerClass({
             }
         }
 
-        // The connection accepted from the device, if any
+        // The connection accepted from the device, if any, which is closed
+        // if accepted once the upload is over
         let connection = null;
+        let over = false;
 
         try {
             // Listen for the incoming connection, which is no longer waited
             // for once the listener is closed
             const acceptConnection = listener.accept_async(cancellable)
                 .then(([accepted]) => {
-                    connection = accepted;
+                    if (over)
+                        accepted.close(null);
+                    else
+                        connection = accepted;
                 });
 
             // Notify the device we're ready
@@ -537,6 +542,8 @@ export const Channel = GObject.registerClass({
                 });
             }
         } finally {
+            over = true;
+
             // Closing the output doesn't end the connection without TLS, so
             // it's closed, whether or not the transfer succeeded
             connection?.close(null);

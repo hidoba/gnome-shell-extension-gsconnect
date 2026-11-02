@@ -61,6 +61,59 @@ describe('A device constructed from a packet', function () {
         expect(device.paired).toBeFalse();
         expect(device._plugins).toHaveSize(0);
     });
+
+    it('cancels transfers when unpaired', function () {
+        device._setPaired(true);
+        const transfer = device.createTransfer();
+        spyOn(transfer, 'cancel').and.callThrough();
+
+        device.unpair();
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(device._transfers).toHaveSize(0);
+        expect(device.paired).toBeFalse();
+        expect(device.settings.get_boolean('paired')).toBeFalse();
+    });
+});
+
+
+describe('A connected device', function () {
+    let device, written;
+
+    beforeAll(function () {
+        device = new Device(Utils.generateIdentity());
+        device._setPaired(true);
+
+        // A channel that is still writing the packets it was given
+        written = [];
+        device._channel = {
+            sendPacket(packet) {
+                written.push(packet.type);
+                return new Promise(() => {});
+            },
+        };
+        device._connected = true;
+    });
+
+    afterAll(function () {
+        device._channel = null;
+        device._connected = false;
+        device.destroy();
+    });
+
+    it('passes packets to the channel in order with its own', function () {
+        device.sendPacket({type: 'kdeconnect.first', body: {}});
+        device.sendPacket({type: 'kdeconnect.second', body: {}});
+
+        // Like the request of an upload, sent by the channel itself
+        device.channel.sendPacket({type: 'kdeconnect.request'});
+
+        expect(written).toEqual([
+            'kdeconnect.first',
+            'kdeconnect.second',
+            'kdeconnect.request',
+        ]);
+    });
 });
 
 
