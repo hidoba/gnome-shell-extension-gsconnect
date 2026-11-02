@@ -31,6 +31,13 @@ const TRANSFER_MIN = 1739;
 const TRANSFER_MAX = 1764;
 
 
+/**
+ * The time in milliseconds to wait for a device to accept a rejected transfer,
+ * which it may never do
+ */
+const REJECT_TIMEOUT = 10000;
+
+
 /*
  * One-time check for Linux/FreeBSD socket options
  */
@@ -706,11 +713,14 @@ export const Channel = GObject.registerClass({
      * Authenticate a TLS connection.
      *
      * @param {Gio.TlsConnection} connection - A TLS connection
-     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer,
-     *   besides the channel
+     * @param {object} [options] - Options for a transfer
+     * @param {Gio.Cancellable} [options.cancellable] - A cancellable for the
+     *   transfer, besides the channel
+     * @param {boolean} [options.transfer] - Whether the connection is for a
+     *   transfer, which anyone on the network may connect to
      * @returns {Promise} A promise for the operation
      */
-    async _authenticate(connection, cancellable = null) {
+    async _authenticate(connection, {cancellable = null, transfer = false} = {}) {
         // Standard TLS Handshake
         connection.validation_flags = Gio.TlsCertificateFlags.EXPIRED;
         connection.authentication_mode = Gio.TlsAuthenticationMode.REQUIRED;
@@ -775,6 +785,13 @@ export const Channel = GObject.registerClass({
              * nuking the Android app data or copying settings between machines.
              */
             if (verified === false) {
+                // Anyone may connect to the port of an upload first, which
+                // must not unpair the device
+                if (transfer) {
+                    throw new Error(`${this.identity.body.deviceName}: ` +
+                        'Transfer authentication failure');
+                }
+
                 if (this.device) {
                     this.device.unpair();
                 } else {
@@ -794,27 +811,29 @@ export const Channel = GObject.registerClass({
      * Wrap the connection in Gio.TlsClientConnection and initiate handshake
      *
      * @param {Gio.TcpConnection} connection - The unauthenticated connection
-     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer
+     * @param {object} [options] - Options for a transfer, as for
+     *   _authenticate()
      * @returns {Gio.TlsClientConnection} The authenticated connection
      */
-    _encryptClient(connection, cancellable = null) {
+    _encryptClient(connection, options = {}) {
         _configureSocket(connection);
 
         connection = Gio.TlsClientConnection.new(connection,
             connection.socket.remote_address);
         connection.set_certificate(this.certificate);
 
-        return this._authenticate(connection, cancellable);
+        return this._authenticate(connection, options);
     }
 
     /**
      * Wrap the connection in Gio.TlsServerConnection and initiate handshake
      *
      * @param {Gio.TcpConnection} connection - The unauthenticated connection
-     * @param {Gio.Cancellable} [cancellable] - A cancellable for a transfer
+     * @param {object} [options] - Options for a transfer, as for
+     *   _authenticate()
      * @returns {Gio.TlsServerConnection} The authenticated connection
      */
-    _encryptServer(connection, cancellable = null) {
+    _encryptServer(connection, options = {}) {
         _configureSocket(connection);
 
         connection = Gio.TlsServerConnection.new(connection, this.certificate);
@@ -825,7 +844,7 @@ export const Channel = GObject.registerClass({
             return true;
         });
 
-        return this._authenticate(connection, cancellable);
+        return this._authenticate(connection, options);
     }
 
     async _exchangeIdentities() {
@@ -955,35 +974,64 @@ export const Channel = GObject.registerClass({
             this.output_stream.close_async(GLib.PRIORITY_DEFAULT, null, null);
     }
 
-    async download(packet, target, cancellable = null) {
+    /**
+     * Connect to the device to transfer a payload.
+     *
+     * @param {Core.Packet} packet - A packet with payload info
+     * @param {Gio.Cancellable} [cancellable] - A cancellable
+     * @returns {Promise<Array>} The authenticated connection, and the
+     *   connection it wraps, which is closed if this fails
+     */
+    async _connectPayload(packet, cancellable = null) {
         const address = Gio.InetSocketAddress.new_from_string(this.host,
             packet.payloadTransferInfo.port);
 
         const client = new Gio.SocketClient({enable_proxy: false});
-        const connection = await client.connect_async(address, cancellable)
-            .then(conn => this._encryptClient(conn, cancellable));
+        const base = await client.connect_async(address, cancellable);
 
-        // Start the transfer
-        const transferredSize = await target.splice_async(
-            connection.input_stream,
-            (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
-             Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
-            GLib.PRIORITY_DEFAULT, cancellable);
-
-        // If we get less than expected, we've certainly got corruption
-        if (transferredSize < packet.payloadSize) {
-            throw new Gio.IOErrorEnum({
-                code: Gio.IOErrorEnum.FAILED,
-                message: `Incomplete: ${transferredSize}/${packet.payloadSize}`,
+        try {
+            const connection = await this._encryptClient(base, {
+                cancellable,
+                transfer: true,
             });
 
-        // TODO: sometimes kdeconnect-android under-reports a file's size
-        //       https://github.com/GSConnect/gnome-shell-extension-gsconnect/issues/1157
-        } else if (transferredSize > packet.payloadSize) {
-            logError(new Gio.IOErrorEnum({
-                code: Gio.IOErrorEnum.FAILED,
-                message: `Extra Data: ${transferredSize - packet.payloadSize}`,
-            }));
+            return [connection, base];
+        } catch (e) {
+            base.close_async(GLib.PRIORITY_DEFAULT, null, null);
+            throw e;
+        }
+    }
+
+    async download(packet, target, cancellable = null) {
+        const [connection, base] = await this._connectPayload(packet,
+            cancellable);
+
+        try {
+            // Start the transfer
+            const transferredSize = await target.splice_async(
+                connection.input_stream,
+                (Gio.OutputStreamSpliceFlags.CLOSE_SOURCE |
+                 Gio.OutputStreamSpliceFlags.CLOSE_TARGET),
+                GLib.PRIORITY_DEFAULT, cancellable);
+
+            // If we get less than expected, we've certainly got corruption
+            if (transferredSize < packet.payloadSize) {
+                throw new Gio.IOErrorEnum({
+                    code: Gio.IOErrorEnum.FAILED,
+                    message: `Incomplete: ${transferredSize}/${packet.payloadSize}`,
+                });
+
+            // TODO: sometimes kdeconnect-android under-reports a file's size
+            //       https://github.com/GSConnect/gnome-shell-extension-gsconnect/issues/1157
+            } else if (transferredSize > packet.payloadSize) {
+                logError(new Gio.IOErrorEnum({
+                    code: Gio.IOErrorEnum.FAILED,
+                    message: `Extra Data: ${transferredSize - packet.payloadSize}`,
+                }));
+            }
+        } catch (e) {
+            base.close_async(GLib.PRIORITY_DEFAULT, null, null);
+            throw e;
         }
     }
 
@@ -1008,14 +1056,18 @@ export const Channel = GObject.registerClass({
 
         // The connection accepted from the device, if any
         let accepted = null;
+        let acceptConnection = null;
 
         try {
             // Listen for the incoming connection, which is no longer waited
             // for once the listener is closed
-            const acceptConnection = listener.accept_async(cancellable)
+            acceptConnection = listener.accept_async(cancellable)
                 .then(result => {
                     accepted = result[0];
-                    return this._encryptServer(accepted, cancellable);
+                    return this._encryptServer(accepted, {
+                        cancellable,
+                        transfer: true,
+                    });
                 });
 
             // Create an upload request
@@ -1044,17 +1096,21 @@ export const Channel = GObject.registerClass({
                 });
             }
         } catch (e) {
-            // A connection accepted for a request that failed isn't used.
-            // Its socket is shut down, since a handshake in progress keeps
-            // the connection from closing, and closing the socket alone
-            // doesn't stop it.
+            // A connection accepted for a request that failed isn't used. A
+            // handshake in progress uses its socket in another thread, which
+            // shutting it down stops, and it's closed once that's done.
             if (accepted !== null) {
+                const connection = accepted;
+
                 try {
-                    accepted.socket.shutdown(true, true);
-                    accepted.socket.close();
-                } catch (e) {
-                    debug(e, this.device?.name);
+                    connection.socket.shutdown(true, true);
+                } catch (e2) {
+                    debug(e2, this.device?.name);
                 }
+
+                acceptConnection.catch(() => {}).then(() => {
+                    connection.close_async(GLib.PRIORITY_DEFAULT, null, null);
+                });
             }
 
             throw e;
@@ -1066,6 +1122,10 @@ export const Channel = GObject.registerClass({
     }
 
     async rejectTransfer(packet) {
+        // The device may never accept the connection
+        const cancellable = new Gio.Cancellable();
+        let timeoutId = 0;
+
         try {
             if (!packet || !packet.hasPayload())
                 return;
@@ -1073,16 +1133,21 @@ export const Channel = GObject.registerClass({
             if (packet.payloadTransferInfo.port === undefined)
                 return;
 
-            const address = Gio.InetSocketAddress.new_from_string(this.host,
-                packet.payloadTransferInfo.port);
+            timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+                this._rejectTimeout ?? REJECT_TIMEOUT, () => {
+                    timeoutId = 0;
+                    cancellable.cancel();
 
-            const client = new Gio.SocketClient({enable_proxy: false});
-            const connection = await client.connect_async(address, null)
-                .then(this._encryptClient.bind(this));
+                    return GLib.SOURCE_REMOVE;
+                });
 
-            connection.close_async(GLib.PRIORITY_DEFAULT, null, null);
+            const [, base] = await this._connectPayload(packet, cancellable);
+            base.close_async(GLib.PRIORITY_DEFAULT, null, null);
         } catch (e) {
-            debug(e, this.device.name);
+            debug(e, this.device?.name);
+        } finally {
+            if (timeoutId !== 0)
+                GLib.Source.remove(timeoutId);
         }
     }
 });

@@ -33,24 +33,28 @@ function isPortFree(port) {
 
 
 /**
- * Wait for the other end of a connection to close it.
+ * Wait for the other end of a connection to close it, ignoring anything it
+ * sends before.
  *
  * @param {Gio.IOStream} connection - A connection
  * @returns {Promise} A promise for the operation
  */
-function waitForClose(connection) {
-    return new Promise(resolve => {
-        connection.input_stream.read_bytes_async(1, GLib.PRIORITY_DEFAULT,
-            null, (stream, res) => {
-                try {
-                    stream.read_bytes_finish(res);
-                } catch {
-                    // A reset connection is closed too
-                }
+async function waitForClose(connection) {
+    let size;
 
-                resolve();
-            });
-    });
+    do {
+        size = await new Promise(resolve => {
+            connection.input_stream.read_bytes_async(4096,
+                GLib.PRIORITY_DEFAULT, null, (stream, res) => {
+                    try {
+                        resolve(stream.read_bytes_finish(res).get_size());
+                    } catch {
+                        // A reset connection is closed too
+                        resolve(0);
+                    }
+                });
+        });
+    } while (size > 0);
 }
 
 
@@ -248,10 +252,132 @@ describe('A LAN channel service', function () {
 
                 cancellable.cancel();
                 await expectAsync(download).toBeRejected();
+                await waitForClose(stalled);
             } finally {
                 stalled?.close(null);
                 server.close();
             }
+        });
+
+        it('that stop rejecting a transfer the device does not encrypt', async function () {
+            // Like a device that connects, but never completes the handshake
+            const server = new Gio.SocketListener();
+            const port = server.add_any_inet_port(null);
+            let stalled = null;
+            server.accept_async(null).then(([connection]) => {
+                stalled = connection;
+            });
+
+            const packet = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {},
+                payloadSize: 1,
+                payloadTransferInfo: {port},
+            });
+            remoteChannel._rejectTimeout = 200;
+
+            try {
+                await remoteChannel.rejectTransfer(packet);
+
+                expect(stalled).not.toBeNull();
+                await waitForClose(stalled);
+            } finally {
+                remoteChannel._rejectTimeout = undefined;
+                stalled?.close(null);
+                server.close();
+            }
+        });
+
+        it('that are not unpaired by others connecting to an upload', async function () {
+            const settings = new Gio.Settings({
+                settings_schema: Config.GSCHEMA.lookup(
+                    'org.gnome.Shell.Extensions.GSConnect.Device', true),
+                path: '/org/gnome/shell/extensions/gsconnect/device/' +
+                    `${localChannel.identity.body.deviceId}/`,
+            });
+            const [, pem] = GLib.file_get_contents(
+                Utils.getDataPath('remote-certificate.pem'));
+            settings.set_string('certificate-pem', new TextDecoder().decode(pem));
+            settings.set_boolean('paired', true);
+
+            // Another host connects first, with another certificate
+            const otherCert = Gio.TlsCertificate.new_from_files(
+                Utils.getDataPath('local-certificate.pem'),
+                Utils.getDataPath('local-private.pem'));
+            let other = null;
+
+            spyOn(localChannel, 'sendPacket').and.callFake(async request => {
+                const address = Gio.InetSocketAddress.new_from_string(
+                    '127.0.0.1', request.payloadTransferInfo.port);
+                const connection = await new Gio.SocketClient({
+                    enable_proxy: false,
+                }).connect_async(address, null);
+
+                other = Gio.TlsClientConnection.new(connection, address);
+                other.set_certificate(otherCert);
+                other.connect('accept-certificate', () => true);
+                other.handshake_async(GLib.PRIORITY_DEFAULT, null)
+                    .catch(() => {});
+            });
+
+            const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
+            const bytes = new GLib.Bytes('upload');
+
+            try {
+                await expectAsync(localChannel.upload(packet,
+                    Gio.MemoryInputStream.new_from_bytes(bytes),
+                    bytes.get_size())).toBeRejected();
+
+                expect(settings.get_boolean('paired')).toBeTrue();
+                expect(settings.get_string('certificate-pem')).not.toBe('');
+            } finally {
+                other?.base_io_stream.close(null);
+                settings.reset('paired');
+                settings.reset('certificate-pem');
+            }
+        });
+
+        it('that write packets one at a time', async function () {
+            const packets = ['first', 'second', 'third'].map(name => {
+                return new Core.Packet({type: 'kdeconnect.test', body: {name}});
+            });
+
+            await Promise.all(packets.map(packet => {
+                return localChannel.sendPacket(packet);
+            }));
+
+            for (const packet of packets) {
+                const received = await remoteChannel.readPacket();
+                expect(received.body.name).toBe(packet.body.name);
+            }
+        });
+
+        it('that only skip packets cancelled before they are written', async function () {
+            const cancellable = new Gio.Cancellable();
+            const first = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {name: 'first'},
+            });
+            const skipped = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {name: 'skipped'},
+            });
+            const last = new Core.Packet({
+                type: 'kdeconnect.test',
+                body: {name: 'last'},
+            });
+
+            // The first packet is written in full, even if cancelled
+            const writeFirst = localChannel.sendPacket(first, cancellable);
+            const writeSkipped = localChannel.sendPacket(skipped, cancellable);
+            cancellable.cancel();
+
+            await expectAsync(writeFirst).toBeResolved();
+            await expectAsync(writeSkipped).toBeRejected();
+            await localChannel.sendPacket(last);
+
+            expect((await remoteChannel.readPacket()).body.name).toBe('first');
+            expect((await remoteChannel.readPacket()).body.name).toBe('last');
         });
 
         it('that stop an upload the device does not encrypt', async function () {
@@ -293,16 +419,11 @@ describe('A LAN channel service', function () {
                 client = await new Gio.SocketClient({enable_proxy: false})
                     .connect_async(address, null);
 
-                // Let the connection be accepted
-                await new Promise(resolve => {
-                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                        resolve();
-                        return GLib.SOURCE_REMOVE;
-                    });
-                });
-
+                // Fail once the connection is accepted
+                await Utils.waitFor(() => localChannel._encryptServer.calls.any());
                 throw new Error('Request failed');
             });
+            spyOn(localChannel, '_encryptServer').and.callThrough();
 
             const packet = new Core.Packet({type: 'kdeconnect.test', body: {}});
             const bytes = new GLib.Bytes('upload');

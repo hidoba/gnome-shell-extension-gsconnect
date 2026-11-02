@@ -253,12 +253,29 @@ export const Channel = GObject.registerClass({
      * @param {Gio.Cancellable} [cancellable] - A cancellable
      * @returns {Promise<boolean>} %true if successful
      */
-    sendPacket(packet, cancellable = null) {
-        if (cancellable === null)
-            cancellable = this.cancellable;
+    async sendPacket(packet, cancellable = null) {
+        // Packets are written one at a time, since a write can't start before
+        // the last one is done, and a packet that started to be written is
+        // only stopped with the channel, so it's never written in part
+        const previous = this._writing ?? null;
+        let finish;
+        const writing = new Promise(resolve => (finish = resolve));
+        this._writing = writing;
 
-        return this.output_stream.write_all_async(packet.serialize(),
-            GLib.PRIORITY_DEFAULT, cancellable);
+        try {
+            if (previous !== null)
+                await previous;
+
+            cancellable?.set_error_if_cancelled();
+
+            return await this.output_stream.write_all_async(
+                packet.serialize(), GLib.PRIORITY_DEFAULT, this.cancellable);
+        } finally {
+            finish();
+
+            if (this._writing === writing)
+                this._writing = null;
+        }
     }
 
     /**
