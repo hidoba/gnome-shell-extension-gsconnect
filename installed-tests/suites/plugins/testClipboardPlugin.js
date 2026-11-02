@@ -938,6 +938,70 @@ describe('The clipboard plugin', function () {
         }
     });
 
+    it('keeps a received file reported again after reconnecting', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        await remotePlugin._handleFile(filePacket('reconnected.vcf'));
+        const dir = remotePlugin._currentDir;
+        const content = remotePlugin._clipboard.content;
+
+        // What was applied is forgotten on reconnecting, so the file is
+        // reported again as a local change
+        remotePlugin.connected();
+        remotePlugin._clipboard._setContent({...content});
+        await remotePlugin.clearCache();
+
+        expect(remotePlugin._currentDir.equal(dir)).toBeTrue();
+        expect(dir.query_exists(null)).toBeTrue();
+    });
+
+    it('does not keep a local file as a received one', function () {
+        remotePlugin._clipboard._setContent({
+            type: 'file',
+            uri: Utils.getDataUri('vcard-valid.vcf'),
+        });
+
+        expect(remotePlugin._currentDir).toBeNull();
+    });
+
+    it('applies text sent again before the clipboard reads back', async function () {
+        remotePlugin._clipboard.text = 'held before';
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
+        remotePlugin._clipboard.async = true;
+
+        try {
+            // The device sends other text, then what the clipboard held,
+            // before the first is read back
+            for (const text of ['sent between', 'held before']) {
+                remotePlugin.handlePacket(new Core.Packet({
+                    type: 'kdeconnect.clipboard',
+                    body: {content: text},
+                }));
+            }
+
+            await expectNotSentBack(remotePlugin);
+            expect(remotePlugin._clipboard.content.text).toBe('held before');
+        } finally {
+            remotePlugin._clipboard.async = false;
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('compares an image with content applied but not yet read back', async function () {
+        remotePlugin._clipboard._setContent({type: 'image'},
+            {checksum: 'held before'});
+        const image = {type: 'image', checksum: 'held before'};
+
+        expect(await remotePlugin._isLocalImage(image)).toBeTrue();
+
+        remotePlugin._expectEcho({type: 'text', text: 'applied since'});
+        expect(await remotePlugin._isLocalImage(image)).toBeFalse();
+
+        remotePlugin._expectEcho({type: 'image', checksum: 'held before'});
+        expect(await remotePlugin._isLocalImage(image)).toBeTrue();
+    });
+
     it('recognizes contents applied in quick succession', async function () {
         const image = tempFile('quick.png', path => {
             const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
@@ -976,11 +1040,12 @@ describe('The clipboard plugin', function () {
         remotePlugin._clipboard.async = true;
 
         try {
-            // All are applied before the first is reported
+            // All are applied before the first is reported, which reports
+            // the last, and some are applied more than once
             for (let i = 0; i < 8; i++) {
                 remotePlugin.handlePacket(new Core.Packet({
                     type: 'kdeconnect.clipboard',
-                    body: {content: `burst ${i}`},
+                    body: {content: `burst ${i % 3}`},
                 }));
             }
 

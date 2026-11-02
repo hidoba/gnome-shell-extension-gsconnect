@@ -672,12 +672,38 @@ const ClipboardPlugin = GObject.registerClass({
         // Content applied from the device may be reported again, for example
         // by a clipboard manager, and is still in the clipboard. Once the
         // device has changed its clipboard since, it is sent back.
+        // A received file may also be reported again once that is forgotten,
+        // after reconnecting, so its directory is kept while it's in the
+        // clipboard.
         if (!isSameContent(content, this._pulledContent)) {
             this._pulledContent = null;
-            this._currentDir = null;
+            this._currentDir = this._getReceivedDirectory(content);
         } else if (this._remoteContent === null) {
             this._pulledContent = null;
         }
+    }
+
+    /**
+     * Get the directory of a file received from the device, which a local
+     * clipboard content holds.
+     *
+     * @param {object} content - The local clipboard content
+     * @returns {Gio.File|null} The directory of the received file, or %null
+     */
+    _getReceivedDirectory(content) {
+        let file = null;
+
+        if (content.type === 'file')
+            file = Gio.File.new_for_uri(content.uri);
+        else if (content.type === 'text' && isReceivedPath(content.text))
+            file = Gio.File.new_for_path(content.text);
+
+        const dir = file?.get_parent() ?? null;
+
+        if (dir === null || !this._getReceiveDirectory().equal(dir.get_parent()))
+            return null;
+
+        return dir;
     }
 
     /**
@@ -766,6 +792,19 @@ const ClipboardPlugin = GObject.registerClass({
 
         const [applied] = this._pendingEchoes.splice(0, index + 1).slice(-1);
         return applied;
+    }
+
+    /**
+     * Get the content the local clipboard holds once the content applied from
+     * the device is reported, since the clipboard only reads it back then.
+     *
+     * @returns {object|null} The last content applied from the device, or
+     *   the local clipboard content if none is expected
+     */
+    _getExpectedContent() {
+        this._dropExpiredEchoes();
+
+        return this._pendingEchoes.at(-1) ?? this._clipboard.content;
     }
 
     /**
@@ -1151,7 +1190,7 @@ const ClipboardPlugin = GObject.registerClass({
 
                 // Compare with the clipboard itself, which may have been
                 // cleared since the text was last set
-                if (!isSameContent(this._clipboard.content, content)) {
+                if (!isSameContent(this._getExpectedContent(), content)) {
                     this._localBuffer = content.text;
                     this._localTimestamp = Date.now();
 
@@ -1243,6 +1282,12 @@ const ClipboardPlugin = GObject.registerClass({
      *   or %false if it's not or the local image can't be read
      */
     async _isLocalImage(content) {
+        // The local image is only read back once applied content is reported
+        this._dropExpiredEchoes();
+
+        if (this._pendingEchoes.length > 0)
+            return isSameContent(this._pendingEchoes.at(-1), content);
+
         if (this._clipboard.content?.type !== 'image')
             return false;
 

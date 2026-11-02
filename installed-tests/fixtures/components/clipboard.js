@@ -84,27 +84,30 @@ const Component = GObject.registerClass({
     }
 
     _setContent(content, image = null) {
-        this._content = content;
-        this._image = image;
-
         if (content.type !== 'text' && this._text !== '') {
             this._text = '';
             this.notify('text');
         }
 
         if (!this.async) {
+            this._content = content;
+            this._image = image;
             this.emit('content-changed');
             return;
         }
 
-        // Report the content set after a delay, like a round trip to the
-        // session clipboard, even if changed again in the meantime
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
-            const current = [this._content, this._image];
-            this._content = content;
-            this._image = image;
+        // Like the real component, the content set is only read back after a
+        // round trip to the session clipboard, and changes in the meantime
+        // are reported once, as the last of them
+        this._unreported = [content, image];
+
+        if (this._reportId)
+            return;
+
+        this._reportId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
+            [this._content, this._image] = this._unreported;
+            this._reportId = 0;
             this.emit('content-changed');
-            [this._content, this._image] = current;
 
             return GLib.SOURCE_REMOVE;
         });
