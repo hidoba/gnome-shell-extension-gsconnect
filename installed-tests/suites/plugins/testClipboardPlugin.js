@@ -654,6 +654,26 @@ describe('The clipboard plugin', function () {
         expect(remotePlugin._clipboard.text).toBe('copied locally');
     });
 
+    it('keeps a file being received, once copied locally', async function () {
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+
+        const received = remotePlugin._handleFile(filePacket('copied.bin'));
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+
+        // The partial file is copied, which supersedes receiving it
+        const file = transfer.file;
+        remotePlugin._clipboard._setContent({
+            type: 'file',
+            uri: file.get_uri(),
+        });
+        await received;
+
+        expect(transfer.cancel).toHaveBeenCalled();
+        expect(remotePlugin._currentDir.equal(file.get_parent())).toBeTrue();
+        expect(file.query_exists(null)).toBeTrue();
+    });
+
     it('removes a partially received file, even if destroyed', async function () {
         const transfer = pendingTransfer();
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
@@ -956,12 +976,77 @@ describe('The clipboard plugin', function () {
     });
 
     it('does not keep a local file as a received one', function () {
-        remotePlugin._clipboard._setContent({
-            type: 'file',
-            uri: Utils.getDataUri('vcard-valid.vcf'),
-        });
+        spyOn(remotePlugin, '_getReceiveDirectory').and.callThrough();
 
-        expect(remotePlugin._currentDir).toBeNull();
+        // A file of another device is not this device's to keep
+        const otherDevice = Gio.File.new_for_path(GLib.build_filenamev([
+            Config.CACHEDIR, 'other-device', 'clipboard', 'dir', 'file',
+        ]));
+
+        for (const uri of [
+            Utils.getDataUri('vcard-valid.vcf'),
+            otherDevice.get_uri(),
+            'file:///at-the-root',
+        ]) {
+            remotePlugin._clipboard._setContent({type: 'file', uri});
+            expect(remotePlugin._currentDir).toBeNull();
+        }
+
+        // Nor is a directory created for it
+        expect(remotePlugin._getReceiveDirectory).not.toHaveBeenCalled();
+    });
+
+    it('applies text another device sent before the clipboard reads back', function () {
+        // The plugins share a clipboard in the service, if not in tests
+        remotePlugin._clipboard.text = 'held before';
+        spyOn(remotePlugin, '_expectEcho').and.callThrough();
+
+        try {
+            // The other device's text is applied, but not yet read back
+            localPlugin._expectEcho({type: 'text', text: 'other device'});
+
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'held before'},
+            }));
+
+            expect(remotePlugin._expectEcho).toHaveBeenCalled();
+            expect(remotePlugin._clipboard.text).toBe('held before');
+        } finally {
+            localPlugin._pendingEchoes = [];
+        }
+    });
+
+    it('applies an image pulled again while it is applied', async function () {
+        const image = tempFile('twice.png', path => {
+            const pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                false, 8, 16, 16);
+            pixbuf.fill(0x13579bff);
+            pixbuf.savev(path, 'png', [], []);
+        });
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(image));
+        spyOn(remotePlugin, '_applyImage').and.callThrough();
+        await remotePlugin._handleFile(filePacket('twice.png'));
+        await remotePlugin._applyImage.calls.mostRecent().returnValue;
+        const checksum = remotePlugin._remoteContent.checksum;
+
+        remotePlugin._clipboard.text = 'copied since';
+
+        // Pulled again as soon as it's expected, before it is applied
+        const expectEcho = remotePlugin._expectEcho;
+        spyOn(remotePlugin, '_expectEcho').and.callFake(content => {
+            expectEcho.call(remotePlugin, content);
+
+            if (remotePlugin._expectEcho.calls.count() === 1)
+                remotePlugin.clipboardPull();
+        });
+        remotePlugin.clipboardPull();
+        await Promise.all(remotePlugin._applyImage.calls.all()
+            .map(call => call.returnValue));
+
+        const applied = await remotePlugin._clipboard.getImage();
+        expect(applied?.checksum).toBe(checksum);
     });
 
     it('applies text sent again before the clipboard reads back', async function () {
@@ -1052,6 +1137,7 @@ describe('The clipboard plugin', function () {
             // None is sent back, although the device sent newer ones
             await Utils.waitFor(() => remotePlugin._pendingEchoes.length === 0);
             await Promise.idle(GLib.PRIORITY_DEFAULT);
+            expect(remotePlugin._clipboard.text).toBe('burst 1');
             expect(remotePlugin.clipboardPush).not.toHaveBeenCalled();
             expect(remotePlugin.device.sendPacket).not.toHaveBeenCalled();
         } finally {
