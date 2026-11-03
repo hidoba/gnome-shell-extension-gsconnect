@@ -503,6 +503,7 @@ describe('The clipboard plugin', function () {
 
     it('does not push directories', async function () {
         spyOn(localPlugin, 'clipboardPush').and.callThrough();
+        spyOn(localPlugin.device, 'createTransfer').and.callThrough();
 
         localPlugin._clipboard.setFile(
             Gio.File.new_for_path(Utils.getDataPath('album.png'))
@@ -510,7 +511,32 @@ describe('The clipboard plugin', function () {
 
         // Wait for the asynchronous file query
         await localPlugin.clipboardPush.calls.mostRecent().returnValue;
-        expect(localPlugin.device.sendPacket).not.toHaveBeenCalled();
+        expect(localPlugin.clipboardPush).toHaveBeenCalled();
+        expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
+    });
+
+    it('does not push files larger than allowed', async function () {
+        spyOn(localPlugin, 'clipboardPush').and.callThrough();
+        spyOn(localPlugin.device, 'createTransfer').and.callThrough();
+
+        // A sparse file, one byte larger than allowed
+        const file = tempFile('large.bin', path => {
+            const stream = Gio.File.new_for_path(path).replace(null, false,
+                Gio.FileCreateFlags.NONE, null);
+            stream.seek(MAX_FILE_SIZE, GLib.SeekType.SET, null);
+            stream.write_bytes(new GLib.Bytes([0]), null);
+            stream.close(null);
+        });
+
+        try {
+            localPlugin._clipboard.setFile(file.get_uri());
+
+            // Wait for the asynchronous file query
+            await localPlugin.clipboardPush.calls.mostRecent().returnValue;
+            expect(localPlugin.device.createTransfer).not.toHaveBeenCalled();
+        } finally {
+            file.delete(null);
+        }
     });
 
     it('does not push files to devices without support', async function () {
