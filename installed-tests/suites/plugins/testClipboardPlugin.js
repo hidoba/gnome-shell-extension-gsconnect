@@ -1095,6 +1095,10 @@ describe('The clipboard plugin', function () {
         spyOn(remotePlugin, 'clipboardPush');
         remotePlugin.settings.set_boolean('send-content', true);
 
+        // Each is applied at a later time
+        let now = GLib.get_monotonic_time();
+        spyOn(GLib, 'get_monotonic_time').and.callFake(() => ++now);
+
         try {
             remotePlugin.handlePacket(new Core.Packet({
                 type: 'kdeconnect.clipboard',
@@ -1112,6 +1116,61 @@ describe('The clipboard plugin', function () {
             localPlugin._pendingEchoes = [];
             remotePlugin.settings.set_boolean('send-content', false);
         }
+    });
+
+    it('sends an image another device may have applied', function () {
+        spyOn(remotePlugin, 'clipboardPush');
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            // Only that device's plugin can tell if it's the image applied
+            localPlugin._expectEcho({type: 'image', checksum: 'other device'});
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'this device'},
+            }));
+
+            remotePlugin._clipboard._setContent({type: 'image'},
+                {checksum: 'copied locally'});
+
+            expect(remotePlugin.clipboardPush).toHaveBeenCalled();
+        } finally {
+            localPlugin._pendingEchoes = [];
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('only supersedes other devices with content it applies', async function () {
+        const time = remotePlugin._remoteTime;
+
+        // Rejected
+        await remotePlugin._handleFile(filePacket('large.bin',
+            MAX_FILE_SIZE + 1));
+        expect(remotePlugin._remoteTime).toBe(time);
+
+        // Not received
+        remotePlugin.settings.set_boolean('receive-content', false);
+
+        try {
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'not received'},
+            }));
+            expect(remotePlugin._remoteTime).toBe(time);
+        } finally {
+            remotePlugin.settings.set_boolean('receive-content', true);
+        }
+
+        // Superseded while received
+        const transfer = pendingTransfer();
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
+        const received = remotePlugin._handleFile(filePacket('superseded.bin'));
+        expect(remotePlugin._remoteTime).toBeGreaterThan(time);
+
+        await Promise.idle(GLib.PRIORITY_DEFAULT);
+        remotePlugin._clipboard.text = 'copied while received';
+        await received;
+        expect(remotePlugin._remoteTime).toBe(time);
     });
 
     it('applies an image pulled again while it is applied', async function () {
