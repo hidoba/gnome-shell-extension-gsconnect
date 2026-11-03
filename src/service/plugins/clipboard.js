@@ -268,8 +268,9 @@ const ClipboardPlugin = GObject.registerClass({
         this._remoteSerial = 0;
 
         // When content from the device was last applied, or started being
-        // received, in monotonic time
+        // received, and when it was last applied, in monotonic time
         this._remoteTime = 0;
+        this._appliedTime = 0;
 
         clipboardPlugins.add(this);
     }
@@ -498,13 +499,11 @@ const ClipboardPlugin = GObject.registerClass({
 
         // Content applied from another device before is superseded by the
         // file, unless it isn't applied
-        const previousTime = this._remoteTime;
         const startTime = GLib.get_monotonic_time();
         this._remoteTime = startTime;
 
         let dir = null;
         let received = false;
-        let applied = false;
 
         // Cancelled when superseded, or when the plugin is destroyed
         const cancellable = new Gio.Cancellable();
@@ -574,7 +573,6 @@ const ClipboardPlugin = GObject.registerClass({
             this._currentDir = dir;
             this._receivingDirs.delete(dir.get_path());
             this._onRemoteClipboardChanged(content);
-            applied = true;
 
             // Remove previously received files, which this one replaces
             await this._cleanReceiveDirectory(receiveDir);
@@ -595,8 +593,10 @@ const ClipboardPlugin = GObject.registerClass({
             if (dir !== null)
                 this._receivingDirs.delete(dir.get_path());
 
-            if (!applied && this._remoteTime === startTime)
-                this._remoteTime = previousTime;
+            // Unless applied or superseded by another file, only content
+            // applied before supersedes other devices'
+            if (this._remoteTime === startTime)
+                this._remoteTime = this._appliedTime;
 
             pluginCancellable.disconnect(cancelledId);
 
@@ -1313,7 +1313,7 @@ const ClipboardPlugin = GObject.registerClass({
                     this._clipboard.content;
 
                 if (!isSameContent(current, content)) {
-                    this._remoteTime = GLib.get_monotonic_time();
+                    this._setAppliedTime();
                     this._localBuffer = content.text;
                     this._localTimestamp = Date.now();
 
@@ -1328,7 +1328,7 @@ const ClipboardPlugin = GObject.registerClass({
                 if (content.uri === undefined)
                     break;
 
-                this._remoteTime = GLib.get_monotonic_time();
+                this._setAppliedTime();
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
                 this._pulledContent = content;
@@ -1341,7 +1341,7 @@ const ClipboardPlugin = GObject.registerClass({
                 if (content.version !== undefined)
                     break;
 
-                this._remoteTime = GLib.get_monotonic_time();
+                this._setAppliedTime();
                 this._localBuffer = null;
                 this._localTimestamp = Date.now();
                 this._pulledContent = content;
@@ -1354,6 +1354,15 @@ const ClipboardPlugin = GObject.registerClass({
                 break;
             }
         }
+    }
+
+    /**
+     * Record that content from the device is applied, which supersedes
+     * content other devices applied before.
+     */
+    _setAppliedTime() {
+        this._appliedTime = GLib.get_monotonic_time();
+        this._remoteTime = this._appliedTime;
     }
 
     /**

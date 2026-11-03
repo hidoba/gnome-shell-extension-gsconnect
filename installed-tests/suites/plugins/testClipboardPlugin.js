@@ -1161,16 +1161,35 @@ describe('The clipboard plugin', function () {
             remotePlugin.settings.set_boolean('receive-content', true);
         }
 
-        // Superseded while received
-        const transfer = pendingTransfer();
-        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
-        const received = remotePlugin._handleFile(filePacket('superseded.bin'));
+        // Superseded while received, after superseding another
+        const createTransfer = spyOn(remotePlugin.device, 'createTransfer')
+            .and.returnValues(pendingTransfer(), pendingTransfer());
+        const received = [
+            remotePlugin._handleFile(filePacket('superseded.bin')),
+            remotePlugin._handleFile(filePacket('superseding.bin')),
+        ];
         expect(remotePlugin._remoteTime).toBeGreaterThan(time);
 
         await Promise.idle(GLib.PRIORITY_DEFAULT);
         remotePlugin._clipboard.text = 'copied while received';
-        await received;
+        await Promise.all(received);
         expect(remotePlugin._remoteTime).toBe(time);
+
+        // Received, but no longer applied once loaded
+        createTransfer.and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+        spyOn(remotePlugin, '_loadFile').and.callFake(file => {
+            remotePlugin.settings.set_boolean('receive-content', false);
+            return Promise.resolve({type: 'file', uri: file.get_uri()});
+        });
+
+        try {
+            await remotePlugin._handleFile(filePacket('not applied.vcf'));
+            expect(remotePlugin._loadFile).toHaveBeenCalled();
+            expect(remotePlugin._remoteTime).toBe(time);
+        } finally {
+            remotePlugin.settings.set_boolean('receive-content', true);
+        }
     });
 
     it('applies an image pulled again while it is applied', async function () {
