@@ -99,6 +99,12 @@ const ECHO_TIMEOUT = 10000;
  */
 const clipboardPlugins = new Set();
 
+/**
+ * Local clipboard changes recognized as content applied from a device, and
+ * when that content was applied, so other devices' plugins can tell.
+ */
+const appliedReports = new WeakMap();
+
 
 /**
  * The maximum length in bytes of the name of a received file, which leaves
@@ -261,6 +267,9 @@ const ClipboardPlugin = GObject.registerClass({
         this._localSerial = 0;
         this._remoteSerial = 0;
 
+        // When the device last sent content, in monotonic time
+        this._remoteTime = 0;
+
         clipboardPlugins.add(this);
     }
 
@@ -416,7 +425,7 @@ const ClipboardPlugin = GObject.registerClass({
         // The kept directories are checked as each is reached, since they may
         // change while cleaning up. The file the device holds is kept too,
         // since it can be pulled again after a local copy.
-        const keep = child => this._currentDir?.equal(child) ||
+        const keep = child => this._isCurrentDirectory(child) ||
             this._receivingDirs.has(child.get_path()) ||
             this._isRemoteDirectory(child);
 
@@ -473,6 +482,7 @@ const ClipboardPlugin = GObject.registerClass({
         }
 
         // The remote clipboard changed, regardless of the file being accepted
+        this._remoteTime = GLib.get_monotonic_time();
         this._cancelIncomingTransfer();
         this._cancelOutgoingTransfer();
         const serial = ++this._remoteSerial;
@@ -546,9 +556,11 @@ const ClipboardPlugin = GObject.registerClass({
 
             const content = await this._loadFile(file, cancellable);
 
-            // Ignore files superseded by newer clipboard content
+            // Ignore files superseded by newer clipboard content, unless the
+            // clipboard holds the file since
             if (serial !== this._remoteSerial || cancellable.is_cancelled()) {
-                await this._removeDirectory(dir);
+                if (!this._isCurrentDirectory(dir))
+                    await this._removeDirectory(dir);
                 return;
             }
 
@@ -569,7 +581,7 @@ const ClipboardPlugin = GObject.registerClass({
                 this.device.rejectTransfer(packet);
 
             // The clipboard may hold a file in the directory since
-            if (dir !== null && !(this._currentDir?.equal(dir) ?? false))
+            if (dir !== null && !this._isCurrentDirectory(dir))
                 await this._removeDirectory(dir);
         } finally {
             if (dir !== null)
@@ -654,13 +666,20 @@ const ClipboardPlugin = GObject.registerClass({
         if (content === null || (content.type === 'text' && content.text === ''))
             return;
 
+        const applied = this._getAppliedContent(content);
+
+        // Content another device applied is superseded by content this device
+        // sent since, even if the clipboard only reads it back after that
+        // content was applied, so it's ignored rather than sent to this device
+        if (applied === null && this._isSupersededElsewhere(content))
+            return;
+
         this._localSerial++;
         this._localBuffer = content.type === 'text' ? content.text : null;
         this._localTimestamp = Date.now();
 
         // Supersede any content still being received or applied from the
         // device, unless this is that content being applied
-        const applied = this._getAppliedContent(content);
 
         // Content applied from the device isn't sent back, even if the
         // device has sent newer content since. An image is checked first,
@@ -701,6 +720,16 @@ const ClipboardPlugin = GObject.registerClass({
         } else if (this._remoteContent === null) {
             this._pulledContent = null;
         }
+    }
+
+    /**
+     * Check if a directory holds the received file in the clipboard.
+     *
+     * @param {Gio.File} dir - A directory
+     * @returns {boolean} %true if it holds the file in the clipboard
+     */
+    _isCurrentDirectory(dir) {
+        return this._currentDir?.equal(dir) ?? false;
     }
 
     /**
@@ -793,17 +822,7 @@ const ClipboardPlugin = GObject.registerClass({
      *   the change is a local copy
      */
     _getAppliedContent(content) {
-        this._dropExpiredEchoes();
-
-        // Images are not read just to compare them, so the first image after
-        // applying one is assumed to be it, and checked. Other content may be
-        // reported once for several applied in quick succession, so the last
-        // that matches is taken, which is what the clipboard holds now.
-        const index = content.type === 'image'
-            ? this._pendingEchoes.findIndex(pending => pending.type === 'image')
-            : this._pendingEchoes.findLastIndex(pending => {
-                return isSameContent(content, pending);
-            });
+        const index = this._findAppliedIndex(content);
 
         // Applied content is only reported once, so copying the same content
         // again is a new change. Content applied before it may not be
@@ -812,7 +831,54 @@ const ClipboardPlugin = GObject.registerClass({
             return null;
 
         const [applied] = this._pendingEchoes.splice(0, index + 1).slice(-1);
+        appliedReports.set(content, this._echoTimes.get(applied));
+
         return applied;
+    }
+
+    /**
+     * Find the content applied from the device that a local clipboard change
+     * reports, if any.
+     *
+     * @param {object} content - The local clipboard content
+     * @returns {number} The index of the applied content, or -1
+     */
+    _findAppliedIndex(content) {
+        this._dropExpiredEchoes();
+
+        // Images are not read just to compare them, so the first image after
+        // applying one is assumed to be it, and checked. Other content may be
+        // reported once for several applied in quick succession, so the last
+        // that matches is taken, which is what the clipboard holds now.
+        return content.type === 'image'
+            ? this._pendingEchoes.findIndex(pending => pending.type === 'image')
+            : this._pendingEchoes.findLastIndex(pending => {
+                return isSameContent(content, pending);
+            });
+    }
+
+    /**
+     * Check if a local clipboard change reports content another device
+     * applied before this device sent its content.
+     *
+     * @param {object} content - The local clipboard content
+     * @returns {boolean} %true if the change is superseded for this device
+     */
+    _isSupersededElsewhere(content) {
+        // The other device's plugin may have recognized the change already
+        const times = [appliedReports.get(content)];
+
+        for (const plugin of clipboardPlugins) {
+            if (plugin === this)
+                continue;
+
+            const index = plugin._findAppliedIndex(content);
+
+            if (index !== -1)
+                times.push(plugin._echoTimes.get(plugin._pendingEchoes[index]));
+        }
+
+        return times.some(time => time !== undefined && time <= this._remoteTime);
     }
 
     /**
@@ -894,6 +960,8 @@ const ClipboardPlugin = GObject.registerClass({
     _onRemoteClipboardChanged(content) {
         if (typeof content === 'string')
             content = {type: 'text', text: content};
+
+        this._remoteTime = GLib.get_monotonic_time();
 
         // Supersede any content still being sent to the device
         this._cancelOutgoingTransfer();

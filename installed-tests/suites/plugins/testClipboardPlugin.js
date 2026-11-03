@@ -674,6 +674,26 @@ describe('The clipboard plugin', function () {
         expect(file.query_exists(null)).toBeTrue();
     });
 
+    it('keeps a received file copied locally as it is loaded', async function () {
+        spyOn(remotePlugin.device, 'createTransfer').and.returnValue(
+            mockTransfer(Utils.getDataFile('vcard-valid.vcf')));
+
+        // The file is copied locally as it finishes loading
+        spyOn(remotePlugin, '_loadFile').and.callFake(file => {
+            remotePlugin._clipboard._setContent({
+                type: 'file',
+                uri: file.get_uri(),
+            });
+
+            return Promise.resolve({type: 'file', uri: file.get_uri()});
+        });
+        await remotePlugin._handleFile(filePacket('loaded.vcf'));
+        const file = remotePlugin._loadFile.calls.mostRecent().args[0];
+
+        expect(remotePlugin._currentDir.equal(file.get_parent())).toBeTrue();
+        expect(file.query_exists(null)).toBeTrue();
+    });
+
     it('removes a partially received file, even if destroyed', async function () {
         const transfer = pendingTransfer();
         spyOn(remotePlugin.device, 'createTransfer').and.returnValue(transfer);
@@ -999,6 +1019,7 @@ describe('The clipboard plugin', function () {
     it('applies text another device sent before the clipboard reads back', function () {
         // The plugins share a clipboard in the service, if not in tests
         remotePlugin._clipboard.text = 'held before';
+        const before = remotePlugin._clipboard.content;
         spyOn(remotePlugin, '_expectEcho').and.callThrough();
 
         try {
@@ -1010,10 +1031,86 @@ describe('The clipboard plugin', function () {
                 body: {content: 'held before'},
             }));
 
+            // The text is set again, rather than taken for already there
             expect(remotePlugin._expectEcho).toHaveBeenCalled();
-            expect(remotePlugin._clipboard.text).toBe('held before');
+            expect(remotePlugin._clipboard.content).not.toBe(before);
         } finally {
             localPlugin._pendingEchoes = [];
+        }
+    });
+
+    it('ignores content another device applied before this one sent', async function () {
+        watchPushes(remotePlugin);
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            // The other device's text is applied, then this device sends
+            // text, before the first is read back
+            localPlugin._expectEcho({type: 'text', text: 'other device'});
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'this device'},
+            }));
+            remotePlugin.device.sendPacket.calls.reset();
+            const serial = remotePlugin._remoteSerial;
+
+            // The other device's text is read back late, and recognized by
+            // its plugin first
+            const report = {type: 'text', text: 'other device'};
+            expect(localPlugin._getAppliedContent(report)).not.toBeNull();
+            remotePlugin._clipboard._setContent(report);
+
+            expect(remotePlugin._remoteSerial).toBe(serial);
+            await expectNotSentBack(remotePlugin);
+        } finally {
+            localPlugin._pendingEchoes = [];
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('ignores content another device applied, still expected by it', function () {
+        spyOn(remotePlugin, 'clipboardPush');
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            localPlugin._expectEcho({type: 'text', text: 'other device'});
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'this device'},
+            }));
+
+            remotePlugin._clipboard._setContent({
+                type: 'text',
+                text: 'other device',
+            });
+
+            expect(remotePlugin.clipboardPush).not.toHaveBeenCalled();
+        } finally {
+            localPlugin._pendingEchoes = [];
+            remotePlugin.settings.set_boolean('send-content', false);
+        }
+    });
+
+    it('sends content another device applied after this one sent', function () {
+        spyOn(remotePlugin, 'clipboardPush');
+        remotePlugin.settings.set_boolean('send-content', true);
+
+        try {
+            remotePlugin.handlePacket(new Core.Packet({
+                type: 'kdeconnect.clipboard',
+                body: {content: 'this device'},
+            }));
+            localPlugin._expectEcho({type: 'text', text: 'other device'});
+
+            remotePlugin._clipboard._setContent({
+                type: 'text',
+                text: 'other device',
+            });
+
+            expect(remotePlugin.clipboardPush).toHaveBeenCalled();
+        } finally {
+            localPlugin._pendingEchoes = [];
+            remotePlugin.settings.set_boolean('send-content', false);
         }
     });
 
