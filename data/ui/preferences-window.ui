@@ -414,6 +414,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                 <property name="visible">True</property>
                                 <property name="can_focus">True</property>
                                 <property name="halign">start</property>
+                                <property name="valign">center</property>
                                 <property name="margin_bottom">10</property>
                                 <property name="action_name">win.clipboard-files</property>
                                 <accessibility>
